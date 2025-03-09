@@ -1,0 +1,21 @@
+[package]
+name = "zk_stark_project"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "vdf"
+path = "src/training_aggregation_new.rs"
+
+[dependencies]
+winterfell = { version = "0.12", features = ["concurrent"] }
+winter-utils = "0.12"
+rand = "0.8"        # For randomness in the example
+hex = "0.4"
+
+# Explicitly add funty to resolve version issues
+funty = "3.0.0-rc2"    # Explicitly specifying the prerelease version
+
+# You may also add these lines if issues persist with `ff` or `bitvec`
+# bitvec = "0.22.0"     # Explicitly add bitvec if issues persist
+# ff = "0.11.0"         # Explicitly add ff if issues persist
