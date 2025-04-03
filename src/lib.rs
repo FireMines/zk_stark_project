@@ -491,6 +491,6 @@ pub extern "C" fn free_rust_string(s: *mut c_char) {
         return;
     }
     unsafe {
-        CString::from_raw(s);
+        drop(CString::from_raw(s));
     }
 }
