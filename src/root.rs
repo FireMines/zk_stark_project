@@ -6,7 +6,6 @@ use std::time::Instant;
 use csv::ReaderBuilder;
 use rand::thread_rng;
 use rand_distr::{Distribution, Normal};
-use winterfell::crypto::RandomCoinError;
 use winterfell::{
     AcceptableOptions, Air, AirContext, Assertion, AuxRandElements, BatchingMethod, ByteWriter, CompositionPoly,
     CompositionPolyTrace, ConstraintCompositionCoefficients, DefaultConstraintCommitment, DefaultConstraintEvaluator,
@@ -136,7 +135,53 @@ pub fn transpose(matrix: Vec<Vec<Felt>>) -> Vec<Vec<Felt>> {
     transposed
 }
 
-// ------------------- LOCAL TRAINING MODULE (Client‑Side Update) -------------------
+// ----------------------- SIGNED ARITHMETIC FUNCTIONS -----------------------
+/// Returns (a + b, sign) using a two-part representation.
+/// The sign is determined by comparing to a threshold.
+pub fn signed_add(
+    a: Felt,
+    b: Felt,
+    a_sign: Felt,
+    b_sign: Felt,
+    max: Felt,
+    threshold: Felt,
+) -> (Felt, Felt) {
+    let one = Felt::ONE;
+    let zero = Felt::ZERO;
+    let a_cleansed = if a_sign == zero { a } else { max - a + one };
+    let b_cleansed = if b_sign == zero { b } else { max - b + one };
+    let c = if a_sign == one && b_sign == one {
+        max + one - a_cleansed - b_cleansed
+    } else {
+        a + b
+    };
+    let c_sign = if c.as_int() > threshold.as_int() { one } else { zero };
+    (c, c_sign)
+}
+
+/// Returns (a - b, sign) using the signed addition function.
+pub fn signed_subtract(
+    a: Felt,
+    a_sign: Felt,
+    b: Felt,
+    b_sign: Felt,
+    max: Felt,
+    threshold: Felt,
+) -> (Felt, Felt) {
+    let b_negated_sign = if b_sign == Felt::ZERO { Felt::ONE } else { Felt::ZERO };
+    signed_add(a, b, a_sign, b_negated_sign, max, threshold)
+}
+
+/// Assumes divisor b is positive. Returns (a / b, sign).
+pub fn signed_divide(a: Felt, a_sign: Felt, b: Felt) -> (Felt, Felt) {
+    let a_val = a.as_int();
+    let b_val = b.as_int();
+    let res = a_val / b_val;
+    let sign = a_sign; // For simplicity, keep the original sign.
+    (Felt::new(res), sign)
+}
+
+// ----------------------- LOCAL TRAINING MODULE (Client‑Side Update) -----------------------
 
 pub mod local_training {
     use super::*;
@@ -172,7 +217,7 @@ pub mod local_training {
             target.write(f64_to_felt(self.steps as f64));
         }
     }
-
+    
     impl ToElements<Felt> for TrainingUpdateInputs {
         fn to_elements(&self) -> Vec<Felt> {
             let mut elems = self.initial.clone();
@@ -181,13 +226,13 @@ pub mod local_training {
             elems
         }
     }
-
+    
     /// AIR for the training update circuit.
     pub struct TrainingUpdateAir {
         context: AirContext<Felt>,
         pub_inputs: TrainingUpdateInputs,
     }
-
+    
     impl Air for TrainingUpdateAir {
         type BaseField = Felt;
         type PublicInputs = TrainingUpdateInputs;
@@ -294,7 +339,7 @@ pub mod local_training {
                 trace_length,
             }
         }
-
+    
         pub fn build_trace(&self) -> TraceTable<Felt> {
             // Number of registers: AC*FE (weights) + AC (biases)
             let state_width = AC * FE + AC;
@@ -304,7 +349,7 @@ pub mod local_training {
             let two = f64_to_felt(2.0);
             let fe = self.x.len();  // should equal FE
             let ac = self.y.len();  // should equal AC
-        
+
             // For each additional step, simulate an update.
             for _ in 1..self.trace_length {
                 let mut new_state = state.clone();
@@ -336,7 +381,7 @@ pub mod local_training {
             TraceTable::init(transposed)
         }
     }
-
+    
     impl Prover for TrainingUpdateProver {
         type BaseField = Felt;
         type Air = TrainingUpdateAir;
@@ -350,13 +395,13 @@ pub mod local_training {
             DefaultConstraintEvaluator<'a, Self::Air, E>;
         type ConstraintCommitment<E: FieldElement<BaseField = Self::BaseField>> =
             DefaultConstraintCommitment<E, Self::HashFn, Self::VC>;
-
+    
         fn get_pub_inputs(&self, _trace: &Self::Trace) -> TrainingUpdateInputs {
             let fe = self.x.len();
             let ac = self.y.len();
             let two = f64_to_felt(2.0);
             let mut state = super::flatten_state_matrix(&self.initial_w, &self.initial_b);
-            
+    
             // Simulate update steps exactly as in build_trace.
             for _ in 1..self.trace_length {
                 let mut new_state = state.clone();
@@ -382,7 +427,7 @@ pub mod local_training {
                 }
                 state = new_state;
             }
-            
+    
             TrainingUpdateInputs {
                 initial: super::flatten_state_matrix(&self.initial_w, &self.initial_b),
                 final_state: state,
@@ -393,10 +438,11 @@ pub mod local_training {
                 precision: self.precision,
             }
         }
+    
         fn options(&self) -> &ProofOptions {
             &self.options
         }
-
+    
         fn new_trace_lde<E: FieldElement<BaseField = Self::BaseField>>(
             &self,
             trace_info: &TraceInfo,
@@ -406,7 +452,7 @@ pub mod local_training {
         ) -> (Self::TraceLde<E>, TracePolyTable<E>) {
             DefaultTraceLde::new(trace_info, main_trace, domain, partition_options)
         }
-
+    
         fn new_evaluator<'a, E: FieldElement<BaseField = Self::BaseField>>(
             &self,
             air: &'a Self::Air,
@@ -415,7 +461,7 @@ pub mod local_training {
         ) -> Self::ConstraintEvaluator<'a, E> {
             DefaultConstraintEvaluator::new(air, aux_rand_elements, composition_coefficients)
         }
-
+    
         fn build_constraint_commitment<E: FieldElement<BaseField = Self::BaseField>>(
             &self,
             composition_poly_trace: CompositionPolyTrace<E>,
@@ -433,12 +479,12 @@ pub mod local_training {
     }
 }
 
-// ------------------- GLOBAL UPDATE MODULE (Iterative FedAvg with Averaging) -------------------
+// ------------------- GLOBAL UPDATE MODULE (Iterative FedAvg with Averaging) -----------------------
 
 pub mod global_update {
     use super::*;
     use winterfell::matrix::ColMatrix;
-
+    
     #[derive(Clone)]
     pub struct GlobalUpdateInputs {
         pub global_w: Vec<Vec<Felt>>,    // initial global weights [AC x FE]
@@ -448,7 +494,7 @@ pub mod global_update {
         pub k: Felt,                     // scaling factor
         pub digest: Felt,                // MiMC hash digest of new model
     }
-
+    
     impl Serializable for GlobalUpdateInputs {
         fn write_into<W: ByteWriter>(&self, target: &mut W) {
             for i in 0..AC {
@@ -471,7 +517,7 @@ pub mod global_update {
             target.write(self.digest);
         }
     }
-
+    
     impl ToElements<Felt> for GlobalUpdateInputs {
         fn to_elements(&self) -> Vec<Felt> {
             let mut elems = Vec::new();
@@ -496,13 +542,13 @@ pub mod global_update {
             elems
         }
     }
-
+    
     /// AIR for the global update circuit.
     pub struct GlobalUpdateAir {
         context: AirContext<Felt>,
         pub_inputs: GlobalUpdateInputs,
     }
-
+    
     impl GlobalUpdateAir {
         /// Returns the public initial state (flattened) from the public inputs.
         fn get_public_initial_state(&self) -> Vec<Felt> {
@@ -540,54 +586,36 @@ pub mod global_update {
         fn new(trace_info: TraceInfo, pub_inputs: GlobalUpdateInputs, options: ProofOptions) -> Self {
             // total width = state registers + 1 (time)
             let state_width = AC * FE + AC;
-            let total_width = state_width + 1;
-            let degrees = vec![TransitionConstraintDegree::new(1); total_width];
-            let context = AirContext::new(trace_info, degrees, total_width, options);
+            let degrees = vec![TransitionConstraintDegree::new(1); state_width];
+            let context = AirContext::new(trace_info, degrees, state_width, options);
             Self { context, pub_inputs }
         }
     
-        /// Evaluate transition constraints for the extra time register and for each state register.
         fn evaluate_transition<E: FieldElement<BaseField = Self::BaseField> + From<Felt>>(
             &self,
             frame: &EvaluationFrame<E>,
             _periodic_values: &[E],
             result: &mut [E],
         ) {
-            // Get the trace length.
-            let trace_length = self.context.trace_len();
-            // For the time register (column 0), enforce: next - current - 1 = 0.
-            let one = E::from(Felt::ONE);
-            result[0] = frame.next()[0] - frame.current()[0] - one;
-    
-            // Get the public initial and final state (flattened).
+            let n_minus_one = E::from(Felt::new((self.trace_length() - 1) as u128)).inv();
             let public_initial = self.get_public_initial_state();
             let public_final = self.get_public_new_state();
-            // Compute the expected per-step delta: (final - initial)/(trace_length - 1)
-            let steps = trace_length - 1;
-            let steps_field = E::from(Felt::new(steps as u128));
-    
-            // For each state register, which are in columns 1..(state_width+1)
-            for i in 0..public_initial.len() {
-                let expected_delta = (E::from(public_final[i]) - E::from(public_initial[i])) / steps_field;
-                let t_diff = frame.next()[0] - frame.current()[0]; // time difference (should be 1)
-                let actual_delta = frame.next()[i + 1] - frame.current()[i + 1];
-                // Enforce: actual_delta - expected_delta * t_diff = 0.
-                result[i + 1] = actual_delta - expected_delta * t_diff;
+            let expected_deltas: Vec<E> = public_initial
+                .iter()
+                .zip(public_final.iter())
+                .map(|(init, fin)| E::from(*fin - *init) * n_minus_one)
+                .collect();
+            for i in 0..result.len() {
+                let actual_delta = frame.next()[i] - frame.current()[i];
+                result[i] = actual_delta - expected_deltas[i];
             }
         }
     
-        /// Assert that the final row in the trace has the correct time and state.
         fn get_assertions(&self) -> Vec<Assertion<Self::BaseField>> {
-            let trace_length = self.context.trace_len();
-            let mut assertions = Vec::new();
-            // The final time value should be (trace_length - 1).
-            assertions.push(Assertion::single(0, trace_length - 1, Felt::new((trace_length - 1) as u128)));
             let public_final = self.get_public_new_state();
-            // For each state register (columns 1 and onward), the final row must equal the public final state.
-            for i in 0..public_final.len() {
-                assertions.push(Assertion::single(i + 1, trace_length - 1, public_final[i]));
-            }
-            assertions
+            (0..public_final.len())
+                .map(|i| Assertion::single(i, self.trace_length() - 1, public_final[i]))
+                .collect()
         }
     
         fn context(&self) -> &AirContext<Self::BaseField> {
@@ -595,10 +623,7 @@ pub mod global_update {
         }
     }
         
-
-    // Removed duplicate implementation of get_public_new_state
-
-    // ---------- GlobalUpdateProver using FedAvg aggregation with averaging ----------
+    /// GlobalUpdateProver using iterative FedAvg aggregation with averaging.
     pub struct GlobalUpdateProver {
         pub options: ProofOptions,
         pub global_w: Vec<Vec<Felt>>,
@@ -612,7 +637,7 @@ pub mod global_update {
         pub k: Felt,
         pub trace_length: usize, // padded to a power‑of‑two (min 8)
     }
-
+    
     impl GlobalUpdateProver {
         pub fn new(
             options: ProofOptions,
@@ -641,7 +666,7 @@ pub mod global_update {
                 trace_length: padded_rows,
             }
         }
-
+    
         fn flatten_state(w: &Vec<Vec<Felt>>, b: &Vec<Felt>) -> Vec<Felt> {
             let mut flat = Vec::new();
             for row in w {
@@ -650,102 +675,86 @@ pub mod global_update {
             flat.extend_from_slice(b);
             flat
         }
-
-        /// New averaging-based computation: For each weight and bias, the updated value is
-        /// the global value plus the average difference from the local models.
-        pub fn compute_iterative_state(&self) -> (Vec<Vec<Felt>>, Vec<Felt>, Vec<Vec<Felt>>, Vec<Felt>) {
-            let num_clients = self.local_w.len() as f64;
-            let mut updated_w = self.global_w.clone();
-            let mut updated_b = self.global_b.clone();
-
-            // Update weights: for each weight position, compute the average difference.
-            for i in 0..AC {
-                for j in 0..FE {
-                    let mut sum_diff = f64_to_felt(0.0);
-                    for client in 0..self.local_w.len() {
-                        // Difference: client weight - global weight.
-                        let diff = self.local_w[client][i][j] - self.global_w[i][j];
-                        sum_diff = sum_diff + diff;
+    
+        /// Computes the complete trace of iterative state updates.
+        /// Returns a vector of state rows, one per update (including the initial state).
+        pub fn compute_iterative_trace(&self) -> Vec<Vec<Felt>> {
+            let max = Felt::new(u128::MAX);
+            let threshold = Felt::new(1u128 << 120);
+            let mut current_w = self.global_w.clone();
+            let mut current_w_sign = self.global_w_sign.clone();
+            let mut current_b = self.global_b.clone();
+            let mut current_b_sign = self.global_b_sign.clone();
+            let mut trace_rows = Vec::with_capacity(self.local_w.len() + 1);
+            trace_rows.push(Self::flatten_state(&current_w, &current_b));
+    
+            // Process each client update iteratively.
+            for client in 0..self.local_w.len() {
+                // Update weights.
+                for i in 0..AC {
+                    for j in 0..FE {
+                        let (temp, temp_sign) = signed_subtract(
+                            self.local_w[client][i][j],
+                            self.local_w_sign[client][i][j],
+                            current_w[i][j],
+                            current_w_sign[i][j],
+                            max,
+                            threshold,
+                        );
+                        let (temp2, temp2_sign) = signed_divide(temp, temp_sign, self.k);
+                        let (new_val, new_sign) = signed_add(
+                            current_w[i][j],
+                            current_w_sign[i][j],
+                            temp2,
+                            temp2_sign,
+                            max,
+                            threshold,
+                        );
+                        current_w[i][j] = new_val;
+                        current_w_sign[i][j] = new_sign;
                     }
-                    updated_w[i][j] = self.global_w[i][j] + sum_diff / f64_to_felt(num_clients);
                 }
-            }
-            // Update biases similarly.
-            for i in 0..AC {
-                let mut sum_diff = f64_to_felt(0.0);
-                for client in 0..self.local_b.len() {
-                    let diff = self.local_b[client][i] - self.global_b[i];
-                    sum_diff = sum_diff + diff;
+                // Update biases.
+                for i in 0..AC {
+                    let (temp, temp_sign) = signed_subtract(
+                        self.local_b[client][i],
+                        self.local_b_sign[client][i],
+                        current_b[i],
+                        current_b_sign[i],
+                        max,
+                        threshold,
+                    );
+                    let (temp2, temp2_sign) = signed_divide(temp, temp_sign, self.k);
+                    let (new_bias, new_bias_sign) = signed_add(
+                        current_b[i],
+                        current_b_sign[i],
+                        temp2,
+                        temp2_sign,
+                        max,
+                        threshold,
+                    );
+                    current_b[i] = new_bias;
+                    current_b_sign[i] = new_bias_sign;
                 }
-                updated_b[i] = self.global_b[i] + sum_diff / f64_to_felt(num_clients);
+                // Record the updated state.
+                trace_rows.push(Self::flatten_state(&current_w, &current_b));
             }
-            // For simplicity, we set the sign vectors to zeros.
-            let updated_w_sign = vec![vec![f64_to_felt(0.0); FE]; AC];
-            let updated_b_sign = vec![f64_to_felt(0.0); AC];
-
-            (updated_w, updated_b, updated_w_sign, updated_b_sign)
+            trace_rows
         }
-
+    
+        /// Builds the STARK trace by padding the complete iterative trace to a power-of‑two length.
         pub fn build_trace(&self) -> TraceTable<Felt> {
-            // Compute the flattened state for initial and final values.
-            let initial_state = Self::flatten_state(&self.global_w, &self.global_b);
-            let (new_w, new_b, _new_w_sign, _new_b_sign) = self.compute_iterative_state();
-            let final_state = Self::flatten_state(&new_w, &new_b);
-    
-            // Let state_width be the number of state registers.
-            let state_width = initial_state.len();
-            // We add an extra column for time.
-            let total_width = state_width + 1;
-    
-            // Use the prover's trace_length (which is at least 8 and a power-of-two).
-            let n = self.trace_length; // e.g. 8 or 16
-            let steps = n - 1; // number of transitions
-            let steps_inv = Felt::new(steps as u128).inv();
-    
-            // Build the trace row-by-row. Each row is a vector of length total_width:
-            // [time, state_0, state_1, ..., state_(state_width-1)]
-            let mut trace_rows: Vec<Vec<Felt>> = Vec::with_capacity(n);
-            for t in 0..n {
-                // Compute the interpolation factor: ratio = t / (n - 1)
-                let ratio = Felt::new(t as u128) * steps_inv;
-                let mut row = Vec::with_capacity(total_width);
-                // First column: the time register (we simply use t).
-                row.push(Felt::new(t as u128));
-                // For each state register, compute a linear interpolation.
-                for (init, fin) in initial_state.iter().zip(final_state.iter()) {
-                    let interp = *init + (*fin - *init) * ratio;
-                    row.push(interp);
-                }
-                trace_rows.push(row);
+            let mut trace_rows = self.compute_iterative_trace();
+            let num_rows = trace_rows.len();
+            let padded_rows = num_rows.next_power_of_two().max(8);
+            while trace_rows.len() < padded_rows {
+                trace_rows.push(trace_rows.last().unwrap().clone());
             }
-            // Transpose the trace so that each column becomes a register.
             let transposed = super::transpose(trace_rows);
             TraceTable::init(transposed)
-        }                    }
-
-    pub fn mimc_cipher(input: Felt, round_constant: Felt, z: Felt) -> Felt {
-        let mut inp = input;
-        for _ in 0..64 {
-            let a = inp + round_constant + z;
-            inp = <Felt as FieldElement>::exp(a, 7);
         }
-        inp + z
     }
-
-    pub fn mimc_hash_matrix(w: &[Vec<Felt>], b: &[Felt], round_constants: &[Felt]) -> Felt {
-        let mut z = f64_to_felt(0.0);
-        for i in 0..w.len() {
-            for j in 0..w[i].len() {
-                let rc = round_constants[j % round_constants.len()];
-                z = mimc_cipher(w[i][j], rc, z);
-            }
-            let rc = round_constants[i % round_constants.len()];
-            z = mimc_cipher(b[i], rc, z);
-        }
-        z
-    }
-
-
+    
     impl Prover for GlobalUpdateProver {
         type BaseField = Felt;
         type Air = GlobalUpdateAir;
@@ -759,23 +768,29 @@ pub mod global_update {
             DefaultConstraintEvaluator<'a, Self::Air, E>;
         type ConstraintCommitment<E: FieldElement<BaseField = Self::BaseField>> =
             DefaultConstraintCommitment<E, Self::HashFn, Self::VC>;
-
+    
         fn get_pub_inputs(&self, _trace: &Self::Trace) -> GlobalUpdateInputs {
-            let (new_w, new_b, _new_w_sign, _new_b_sign) = self.compute_iterative_state();
+            let trace_rows = self.compute_iterative_trace();
+            let final_state = trace_rows.last().unwrap().clone();
+            let new_global_w: Vec<Vec<Felt>> = final_state[..(AC * FE)]
+                .chunks(FE)
+                .map(|chunk| chunk.to_vec())
+                .collect();
+            let new_global_b: Vec<Felt> = final_state[(AC * FE)..].to_vec();
             GlobalUpdateInputs {
                 global_w: self.global_w.clone(),
                 global_b: self.global_b.clone(),
-                new_global_w: new_w,
-                new_global_b: new_b,
+                new_global_w,
+                new_global_b,
                 k: self.k,
-                digest: f64_to_felt(0.0), // to be set externally
+                digest: f64_to_felt(0.0),
             }
         }
-
+    
         fn options(&self) -> &ProofOptions {
             &self.options
         }
-
+    
         fn new_trace_lde<E: FieldElement<BaseField = Self::BaseField>>(
             &self,
             trace_info: &TraceInfo,
@@ -785,7 +800,7 @@ pub mod global_update {
         ) -> (Self::TraceLde<E>, TracePolyTable<E>) {
             DefaultTraceLde::new(trace_info, main_trace, domain, partition_options)
         }
-
+    
         fn new_evaluator<'a, E: FieldElement<BaseField = Self::BaseField>>(
             &self,
             air: &'a Self::Air,
@@ -794,7 +809,7 @@ pub mod global_update {
         ) -> Self::ConstraintEvaluator<'a, E> {
             DefaultConstraintEvaluator::new(air, aux_rand_elements, composition_coefficients)
         }
-
+    
         fn build_constraint_commitment<E: FieldElement<BaseField = Self::BaseField>>(
             &self,
             composition_poly_trace: CompositionPolyTrace<E>,
@@ -810,6 +825,28 @@ pub mod global_update {
             )
         }
     }
+    
+    pub fn mimc_cipher(input: Felt, round_constant: Felt, z: Felt) -> Felt {
+        let mut inp = input;
+        for _ in 0..64 {
+            let a = inp + round_constant + z;
+            inp = <Felt as FieldElement>::exp(a, 7);
+        }
+        inp + z
+    }
+    
+    pub fn mimc_hash_matrix(w: &[Vec<Felt>], b: &[Felt], round_constants: &[Felt]) -> Felt {
+        let mut z = f64_to_felt(0.0);
+        for i in 0..w.len() {
+            for j in 0..w[i].len() {
+                let rc = round_constants[j % round_constants.len()];
+                z = mimc_cipher(w[i][j], rc, z);
+            }
+            let rc = round_constants[i % round_constants.len()];
+            z = mimc_cipher(b[i], rc, z);
+        }
+        z
+    }
 }
 
 // ------------------------- MAIN FUNCTION -------------------------
@@ -821,7 +858,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     // --- DATASET LOADING ---
     let (features, labels) = read_dataset("devices/edge_device/data/train.txt")?;
     let client_data = split_dataset(features, labels, C); // 8 clients
-
+    
     // --- CLIENT SIDE: Compute local training updates.
     println!("--- Client Training Updates ---");
     let client_proof_options = ProofOptions::new(
@@ -870,14 +907,13 @@ fn main() -> Result<(), Box<dyn Error>> {
         "Average client update time: {} ms",
         total_client_time / (client_data.len() as u128)
     );
-
+    
     // --- GLOBAL UPDATE: FedAvg Aggregation ---
     println!("\n--- Global Update Example ---");
-    // Generate the global initial model using the same process.
     let (global_w, global_b) = generate_initial_model(FE, AC, 10000.0);
     let global_w_sign: Vec<Vec<Felt>> = vec![vec![f64_to_felt(0.0); FE]; AC];
     let global_b_sign: Vec<Felt> = vec![f64_to_felt(0.0); AC];
-
+    
     let mut local_w = Vec::new();
     let mut local_w_sign = Vec::new();
     let mut local_b = Vec::new();
@@ -885,19 +921,9 @@ fn main() -> Result<(), Box<dyn Error>> {
     for rep in client_final_reps.iter() {
         let client_val = (*rep).as_int() as f64 / 1e6;
         let client_w_mat: Vec<Vec<Felt>> = vec![vec![f64_to_felt(client_val); FE]; AC];
-        let client_w_sign_mat: Vec<Vec<Felt>> = client_w_mat
-            .iter()
-            .map(|row| {
-                row.iter()
-                    .map(|_| f64_to_felt(0.0)) // sign is simplified to zero.
-                    .collect()
-            })
-            .collect();
+        let client_w_sign_mat: Vec<Vec<Felt>> = client_w_mat.iter().map(|row| row.iter().map(|_| f64_to_felt(0.0)).collect()).collect();
         let client_b_vec: Vec<Felt> = vec![f64_to_felt(client_val); AC];
-        let client_b_sign_vec: Vec<Felt> = client_b_vec
-            .iter()
-            .map(|_| f64_to_felt(0.0))
-            .collect();
+        let client_b_sign_vec: Vec<Felt> = client_b_vec.iter().map(|_| f64_to_felt(0.0)).collect();
         local_w.push(client_w_mat);
         local_w_sign.push(client_w_sign_mat);
         local_b.push(client_b_vec);
@@ -918,12 +944,16 @@ fn main() -> Result<(), Box<dyn Error>> {
     );
     let trace = aggregator_prover.build_trace();
     println!("Aggregator trace built with {} rows.", trace.length());
-    let (new_w, new_b, _new_w_sign, _new_b_sign) = aggregator_prover.compute_iterative_state();
-    let flat_new_w: Vec<Felt> = new_w.into_iter().flatten().collect();
-    let flat_new_b: Vec<Felt> = new_b;
+    let trace_rows = aggregator_prover.compute_iterative_trace();
+    let final_state = trace_rows.last().unwrap().clone();
+    let new_global_w: Vec<Vec<Felt>> = final_state[..(AC * FE)]
+        .chunks(FE)
+        .map(|chunk| chunk.to_vec())
+        .collect();
+    let new_global_b: Vec<Felt> = final_state[(AC * FE)..].to_vec();
     let round_constants: Vec<Felt> = (0..64).map(|_| f64_to_felt(42.0)).collect();
-    let new_w_matrix: Vec<Vec<Felt>> = flat_new_w.chunks(FE).map(|chunk| chunk.to_vec()).collect();
-    let computed_digest = global_update::mimc_hash_matrix(&new_w_matrix, &flat_new_b, &round_constants);
+    let flat_new_w: Vec<Felt> = new_global_w.iter().flatten().cloned().collect();
+    let computed_digest = mimc_hash_matrix(&new_global_w, &new_global_b, &round_constants);
     let mut pub_inputs = aggregator_prover.get_pub_inputs(&trace);
     pub_inputs.digest = computed_digest;
     println!("Global (old) weights: {:?}", pub_inputs.global_w);
