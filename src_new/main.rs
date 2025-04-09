@@ -12,24 +12,25 @@ mod training {
 
 use std::error::Error;
 use std::time::Instant;
+use sysinfo::{System, SystemExt};
 
 use helper::{
-    f64_to_felt, generate_initial_model, label_to_one_hot, local_hash_contains, mimc_hash_aggregator, mimc_hash_matrix, read_dataset, split_dataset, u32_to_field, AC, C, FE
+    f64_to_felt, generate_initial_model, label_to_one_hot, local_hash_contains,
+    mimc_hash_aggregator, mimc_hash_matrix, read_dataset, split_dataset, u32_to_field,
+    AC, C, FE,
 };
 use training::prover::TrainingUpdateProver;
 use aggregation::prover::GlobalUpdateProver;
-use winterfell::math::fields::f128::BaseElement as Felt;
-use winterfell::math::{FieldElement, StarkField};
-use winterfell::{
-    verify, AcceptableOptions, BatchingMethod, FieldExtension, ProofOptions, Prover, Trace,
-};
 use winterfell::crypto::hashers::Blake3_256;
 use winterfell::crypto::{DefaultRandomCoin, MerkleTree};
+use winterfell::math::fields::f128::BaseElement as Felt;
+use winterfell::math::{FieldElement, StarkField};
+use winterfell::{verify, AcceptableOptions, BatchingMethod, FieldExtension, ProofOptions, Prover, Trace};
 
 fn main() -> Result<(), Box<dyn Error>> {
     // --- DATASET LOADING ---
     let (features, labels) = read_dataset("devices/edge_device/data/train.txt")?;
-    let client_data = split_dataset(features, labels, C); // 8 clients
+    let client_data = split_dataset(features, labels, C); // e.g. 8 clients
 
     // --- CLIENT SIDE: Compute local training updates.
     println!("--- Client Training Updates ---");
@@ -43,6 +44,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         BatchingMethod::Algebraic,
         BatchingMethod::Algebraic,
     );
+
     let mut total_client_time = 0;
     let mut client_final_reps = Vec::new();
 
@@ -61,26 +63,59 @@ fn main() -> Result<(), Box<dyn Error>> {
             .into());
         }
         let x: Vec<Felt> = sample.iter().map(|&v| f64_to_felt(v)).collect();
+        let x_sign: Vec<Felt> = vec![f64_to_felt(0.0); x.len()];
         let label_val = client_labels[0];
         let y: Vec<Felt> = label_to_one_hot(label_val, AC, 1e6);
         let (init_w, init_b) = generate_initial_model(FE, AC, 10000.0);
         let learning_rate = f64_to_felt(0.0001);
         let precision = f64_to_felt(1e6);
+        // For training the prover, initialize sign vectors (we assume default 0).
+        let w_sign: Vec<Vec<Felt>> = vec![vec![f64_to_felt(0.0); FE]; AC];
+        let b_sign: Vec<Felt> = vec![f64_to_felt(0.0); AC];
+
         let start = Instant::now();
+
         let training_prover = TrainingUpdateProver::new(
             client_proof_options.clone(),
             init_w.clone(),
             init_b.clone(),
+            w_sign,
+            b_sign,
             x,
+            x_sign,
             y,
             learning_rate,
             precision,
         );
         let trace = training_prover.build_trace();
-        let _ = training_prover.prove(trace.clone())?;
+
+        // --- PROOF GENERATION AND BENCHMARKS FOR CLIENT TRAINING ---
+        let training_proof = training_prover.prove(trace.clone())?;
+        let proof_time = start.elapsed();
+        println!("Client {}: Proof generation time: {} ms", i + 1, proof_time.as_millis());
+
+        let proof_bytes = training_proof.to_bytes();
+        println!("Client {}: Training proof size: {} bytes", i + 1, proof_bytes.len());
+
+        // Memory usage via sysinfo.
+        let mut sys = System::new_all();
+        sys.refresh_all();
+        println!("Client {}: Memory usage: {} KB", i + 1, sys.used_memory() as f64 / 1024.0);
+
+        // --- VERIFY THE TRAINING PROOF BEFORE MOVING ON ---
+        let training_pub_inputs = training_prover.get_pub_inputs(&trace);
+        match verify::<training::air::TrainingUpdateAir, Blake3_256<Felt>, DefaultRandomCoin<Blake3_256<Felt>>, MerkleTree<Blake3_256<Felt>>>(
+            training_proof,
+            training_pub_inputs,
+            &AcceptableOptions::OptionSet(vec![client_proof_options.clone()]),
+        ) {
+            Ok(_) => println!("Training proof for client {} verified successfully.", i + 1),
+            Err(e) => println!("Training proof verification for client {} failed: {}", i + 1, e),
+        }
         let elapsed = start.elapsed().as_millis();
-        println!("Client {}: Proof generation time: {} ms", i + 1, elapsed);
+        println!("Client {}: Total proof generation time: {} ms\n", i + 1, elapsed);
         total_client_time += elapsed;
+
         let pub_inputs = training_prover.get_pub_inputs(&trace);
         client_final_reps.push(pub_inputs.final_state[0]);
     }
@@ -115,7 +150,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         local_b_sign.push(client_b_sign_vec);
     }
 
-    // If you later need local_w and local_b, clone them as well:
+    // Clone local parameters for later local hash checking.
     let local_w_clone = local_w.clone();
     let local_b_clone = local_b.clone();
 
@@ -134,7 +169,6 @@ fn main() -> Result<(), Box<dyn Error>> {
     );
     let trace = aggregator_prover.build_trace();
     println!("Aggregator trace built with {} rows.", trace.length());
-    // Clone the trace for public inputs.
     let trace_rows = aggregator_prover.compute_iterative_trace();
     let final_state = trace_rows.last().unwrap().clone();
     let new_global_w: Vec<Vec<Felt>> = final_state[..(AC * FE)]
@@ -143,7 +177,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         .collect();
     let new_global_b: Vec<Felt> = final_state[(AC * FE)..].to_vec();
 
-    // Define round constants as given
+    // Define round constants as a fixed-size array.
     let round_constants: [Felt; 64] = [
         f64_to_felt(42.0),
         f64_to_felt(43.0),
@@ -211,7 +245,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         f64_to_felt(3938980639125.0),
     ];
 
-    // Compute computed digest for new global weights and biases.
+    // Compute the MiMC digest for the new global parameters.
     let computed_digest = mimc_hash_matrix(&new_global_w, &new_global_b, &round_constants);
     let mut pub_inputs = aggregator_prover.get_pub_inputs(&trace);
     pub_inputs.digest = computed_digest;
@@ -221,7 +255,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     println!("New Global (aggregated) biases:  {:?}", pub_inputs.new_global_b);
     println!("Computed MiMC digest: {:?}", computed_digest);
 
-    // Clone the values we need after verify consumes pub_inputs.
+    // Clone values needed for later verification.
     let expected_digest = pub_inputs.digest.clone();
     let expected_new_global_w = pub_inputs.new_global_w.clone();
     let expected_new_global_b = pub_inputs.new_global_b.clone();
@@ -232,7 +266,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         "Global update proof generated in {} ms",
         start.elapsed().as_millis()
     );
-    // Uncomment the following line to print the proof in hex.
+    // Uncomment the line below to print the proof in hex.
     // println!("Global update proof (hex): {}", hex::encode(proof.to_bytes()));
     let acceptable_options = AcceptableOptions::OptionSet(vec![client_proof_options]);
     match verify::<aggregation::air::GlobalUpdateAir, Blake3_256<Felt>, DefaultRandomCoin<Blake3_256<Felt>>, MerkleTree<Blake3_256<Felt>>>(
@@ -261,7 +295,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let lhashes_match = local_hash_contains(&sc_lhashes, &local_hash_check);
     assert!(lhashes_match == Felt::ONE);
 
-    // Finally, compare computed global hash with the expected global digest.
+    // Finally, compare computed global hash with expected digest.
     let result = if mimc_hash_aggregator(&expected_new_global_w, &expected_new_global_b, &round_constants)
         == expected_digest
     {
