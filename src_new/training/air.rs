@@ -38,17 +38,21 @@ fn poly_add<E: FieldElement<BaseField = Felt> + From<Felt>>(
     s_a: E,
     s_b: E,
 ) -> (E, E) {
-    let one: E = E::from(f64_to_felt(1.0));
+    let one: E = E::ONE;
     let max_e: E = E::from(Felt::new(MAX));
     // a_cleansed = (1 - s_a)*a + s_a*(MAX - a + 1)
     let a_cleansed = (one - s_a) * a + s_a * (max_e - a + one);
     let b_cleansed = (one - s_b) * b + s_b * (max_e - b + one);
-    // If both s_a and s_b are 1 then use the alternative formula, else use a + b.
-    let indicator = s_a * s_b; // equals 1 if both are 1, else 0.
-    let c = indicator * (max_e + one - a_cleansed - b_cleansed) + (one - indicator) * (a + b);
+    // Use polynomial blending to compute c:
+    let indicator = s_a * s_b; // Indicator is 1 if both s_a and s_b are 1, else 0.
+    let c: E = indicator * (max_e + one - a_cleansed - b_cleansed)
+        + (one - indicator) * (a + b);
+    // Now compute the sign of c in the same way as in the helper:
+    // This ideally uses a comparison gadget. For now we call compare_gadget.
     let s_c = compare_gadget(c);
     (c, s_c)
 }
+
 
 /// Polynomial gadget for signed subtraction with cleansing.
 fn poly_subtract<E: FieldElement<BaseField = Felt> + From<Felt>>(
@@ -57,13 +61,17 @@ fn poly_subtract<E: FieldElement<BaseField = Felt> + From<Felt>>(
     s_a: E,
     s_b: E,
 ) -> (E, E) {
-    let one: E = E::from(f64_to_felt(1.0));
+    let one: E = E::ONE;
     let max_e: E = E::from(Felt::new(MAX));
+    // Compute cleansed values in the same way.
     let a_cleansed = (one - s_a) * a + s_a * (max_e - a + one);
     let b_cleansed = (one - s_b) * b + s_b * (max_e - b + one);
-    // If s_a != s_b and s_a == 0, then use a_cleansed + b_cleansed; else use a - b.
-    let condition = (one - s_a) * (one - s_b); // equals 1 if both s_a and s_b are 0.
-    let c = condition * (a_cleansed + b_cleansed) + (one - condition) * (a - b);
+    // Define the condition as: if a_sign == 0 and b_sign == 1 then condition == 1, else 0.
+    // This can be computed as: (1 - s_a) * s_b.
+    let condition = (one - s_a) * s_b;
+    // Branch accordingly: if the condition is 1, use addition of cleansed values; otherwise, use subtraction.
+    let c: E = condition * (a_cleansed + b_cleansed) + (one - condition) * (a - b);
+    // Compute the result sign by comparing c with THRESHOLD.
     let s_c = compare_gadget(c);
     (c, s_c)
 }
@@ -75,17 +83,21 @@ fn poly_multiply<E: FieldElement<BaseField = Felt> + From<Felt>>(
     s_a: E,
     s_b: E,
 ) -> (E, E) {
-    let one: E = E::from(f64_to_felt(1.0));
+    // Use E::ONE as the true multiplicative identity.
+    let one: E = E::ONE;
+    // Represent MAX as a field element.
     let max_e: E = E::from(Felt::new(MAX));
+    // Compute cleansed values: if sign is 0, use the original; if nonzero, use (MAX - value + ONE).
     let a_cleansed = (one - s_a) * a + s_a * (max_e - a + one);
     let b_cleansed = (one - s_b) * b + s_b * (max_e - b + one);
+    // Multiply the cleansed values.
     let res = a_cleansed * b_cleansed;
-    // For the product sign, if s_a == s_b then result is as computed; otherwise set sign to 1 if res != 0.
-    let indicator = if s_a == s_b { one - one } else { one }; // placeholder: 0 if equal, 1 if not.
-    let res_final = indicator * (max_e - res + one) + (one - indicator) * res;
-    let s_res = compare_gadget(res_final);
-    let sign = if s_a == s_b || res == E::from(Felt::ZERO) { E::from(Felt::ZERO) } else { E::from(Felt::ONE) };
-
+    // Determine the sign:
+    // If the sign bits are equal or if the product is zero, then the sign is zero; else, the sign is one.
+    let sign = if s_a == s_b || res == E::from(Felt::ZERO) { one - one } else { one };
+    // Compute the final result:
+    // If sign is zero then use res; if sign is one then use (MAX - res + ONE).
+    let res_final = if sign == one - one { res } else { max_e - res + one };
     (res_final, sign)
 }
 
@@ -96,7 +108,7 @@ fn poly_divide<E: FieldElement<BaseField = Felt> + From<Felt> + Copy>(
     s_a: E,
     s_b: E,
 ) -> (E, E) {
-    let one: E = E::from(f64_to_felt(1.0));
+    let one: E = E::ONE;
     let max_e: E = E::from(Felt::new(MAX));
     let a_cleansed = (one - s_a) * a + s_a * (max_e - a + one);
     let b_cleansed = (one - s_b) * b + s_b * (max_e - b + one);
@@ -106,8 +118,10 @@ fn poly_divide<E: FieldElement<BaseField = Felt> + From<Felt> + Copy>(
     let res = a_cleansed * b_inv;
     let indicator = if s_a == s_b || res == E::from(f64_to_felt(0.0)) { one - one } else { one };
     let res_final = indicator * (max_e + one - res) + (one - indicator) * res;
-    let s_res = compare_gadget(res_final);
-    (res_final, s_res)
+    //let s_res = compare_gadget(res_final);
+    let sign = if s_a == s_b || res == E::from(Felt::ZERO) { E::from(Felt::ZERO) } else { E::from(Felt::ONE) };
+
+    (res_final, sign)
 }
 
 /// Public inputs for the training update circuit.
@@ -200,97 +214,144 @@ impl Air for TrainingUpdateAir {
         _periodic_values: &[E],
         result: &mut [E],
     ) {
-        // Convert public parameters to the generic field type E.
+        // Convert public parameters to field type E.
         let learning_rate: E = E::from(self.pub_inputs.learning_rate);
         let pr: E = E::from(self.pub_inputs.precision);
         let fe = self.pub_inputs.x.len();
         let ac = self.pub_inputs.y.len();
-        let one: E = E::from(f64_to_felt(1.0));
+        let one: E = E::ONE;
         // s_zero represents the sign bit 0.
         let s_zero: E = one - one;
     
-        // ---- Compute Forward Propagation: dot product, prediction and error ----
-        // For each activation j, we compute:
-        // dot = sum_{i=0}^{fe-1} poly_add(…, poly_multiply(w[j][i], x[i], 0, 0) ... );
-        // Then, after dividing by pr and adding bias, we get pred.
-        // Then, error is computed as basic_error * (2 / ac).
-        // We'll compute these per activation.
-        let mut error_per_act = vec![E::from(f64_to_felt(0.0)); ac];
+        // --------------- Forward Propagation: Compute dot, pred, error ---------------
+        // We'll compute the dot product for each activation using poly_multiply and poly_add.
+        // Then, we divide by pr and add the bias (via poly_add) to get pred.
+        // Next, we compute the basic error (pred - y) using poly_subtract,
+        // and then scale the error by 2/ac using poly_multiply and poly_divide.
+        // We store the computed error (with its sign) for each activation.
+        let mut error_vals = vec![E::from(f64_to_felt(0.0)); ac];
+        let mut s_error_vals = vec![s_zero; ac];
+    
         for j in 0..ac {
-            // Compute dot = \sum_{i=0}^{fe-1} poly_add over poly_multiply(w, x)
+            // Initialize dot = 0 with sign = 0.
             let mut dot: E = E::from(f64_to_felt(0.0));
             let mut s_dot: E = s_zero;
+            // For each feature i, accumulate poly_multiply(w, x) using poly_add.
             for i in 0..fe {
                 let weight_index = j * fe + i;
-                let w_i: E = frame.current()[weight_index];
-                // Convert public x[i] to E.
+                let w_val: E = frame.current()[weight_index];
+                let s_w: E = s_zero; // assume sign of weight is 0
                 let x_i: E = E::from(self.pub_inputs.x[i]);
-                // Assume sign bits for w[i] and x[i] are zero.
-                let (prod, s_prod) = poly_multiply(w_i, x_i, s_zero, s_zero);
-                // Now add prod to current dot:
+                let s_x: E = s_zero; // assume sign of x is 0
+    
+                let (prod, s_prod) = poly_multiply(w_val, x_i, s_w, s_x);
                 let (new_dot, s_new_dot) = poly_add(dot, prod, s_dot, s_prod);
                 dot = new_dot;
                 s_dot = s_new_dot;
+                            // Debug print only for activation 0, feature 0
+                if j == 0 && i == 0 {
+                    println!("DEBUG FOR ACTIVATION 0, FEATURE 0:");
+                    println!("  w[0][0] = {:?}", w_val);
+                    println!("  x[0] = {:?}", x_i);
+                    println!("  prod = {:?}", prod);
+                }
             }
-            // Divide dot by pr.
+            // Divide dot by pr using poly_divide.
             let (div_dot, s_div_dot) = poly_divide(dot, pr, s_dot, s_zero);
-            // Get current bias for activation j (which is at index ac*fe + j in the state).
+            // Get current bias for activation j:
             let bias_index = ac * fe + j;
             let bias_val: E = frame.current()[bias_index];
-            // Add bias to div_dot.
-            let (pred, s_pred) = poly_add(div_dot, bias_val, s_div_dot, s_zero);
-            // Compute basic_error = pred - y.
+            let s_bias: E = s_zero; // assume bias sign is 0
+            // Add the bias:
+            let (pred, s_pred) = poly_add(div_dot, bias_val, s_div_dot, s_bias);
+            // Compute basic_error = pred - y using poly_subtract.
             let y_val: E = E::from(self.pub_inputs.y[j]);
             let (basic_error, s_basic_error) = poly_subtract(pred, y_val, s_pred, s_zero);
-            // Scale error by 2/ac.
-            let ac_f: E = E::from(f64_to_felt(ac as f64));
+            // Scale error by (2 / ac). First, multiply by 2:
             let (two, s_two) = (E::from(f64_to_felt(2.0)), s_zero);
             let (num, s_num) = poly_multiply(basic_error, two, s_basic_error, s_two);
+            let ac_f: E = E::from(f64_to_felt(ac as f64));
             let (scaled_error, s_scaled_error) = poly_divide(num, ac_f, s_num, s_zero);
-            // Save error for activation j.
-            error_per_act[j] = scaled_error;
+            error_vals[j] = scaled_error;
+            s_error_vals[j] = s_scaled_error;
+                    // Debug print for activation 0: print pred and error.
+            if j == 0 {
+                println!("DEBUG for activation 0:");
+                println!("  dot = {:?}", dot);
+                println!("  div_dot = {:?}", div_dot);
+                println!("  bias = {:?}", bias_val);
+                println!("  pred = {:?}", pred);
+                println!("  y[0] = {:?}", y_val);
+                println!("  basic_error = {:?}", basic_error);
+                println!("  scaled_error = {:?}", scaled_error);
+            }
         }
     
-        // ---- Enforce Backward Propagation Update for Weights and Biases ----
-        // For each activation j and feature i, enforce the update:
-        // expected = poly_subtract(current_weight, grad, 0, s_grad)
-        // where grad is obtained by:
-        // grad = poly_divide( poly_divide( poly_multiply(error, x[i], 0, 0), learning_rate, 0, 0), pr, 0, 0)
+        // --------------- Backward Propagation: Enforce weight and bias updates ---------------
+        // For each activation j and each feature i:
         for j in 0..ac {
             for i in 0..fe {
                 let idx = j * fe + i;
+                println!("  Cell ({}, {}): current = {:?}, next = {:?}, x = {:?}", 
+                0, i, frame.current()[idx], frame.next()[idx], E::from(self.pub_inputs.x[i]));
                 let current = frame.current()[idx];
-                // Use public x[i] and error for activation j.
+                let s_current = s_zero; // assume sign is 0
                 let x_i: E = E::from(self.pub_inputs.x[i]);
-                let s_x: E = s_zero; // assume
-                let s_error: E = s_zero; // assume
-                let error_val = error_per_act[j];
-                
-                // Step 1: Multiply error and x_i using poly_multiply.
+                let s_x = s_zero; // assume sign of x is 0
+                let error_val = error_vals[j];
+                let s_error = s_error_vals[j];
+    
+                // Compute: prod = poly_multiply(error, x_i)
                 let (prod, s_prod) = poly_multiply(error_val, x_i, s_error, s_x);
-                // Step 2: Divide by learning_rate.
+                // Divide prod by learning_rate:
                 let (temp, s_temp) = poly_divide(prod, learning_rate, s_prod, s_zero);
-                // Step 3: Divide by pr.
+                // Divide temp by pr:
                 let (grad, s_grad) = poly_divide(temp, pr, s_temp, s_zero);
-                // Step 4: Subtract grad from current weight.
-                let (expected, _s_expected) = poly_subtract(current, grad, s_zero, s_grad);
-                // The constraint: frame.next()[idx] should equal expected.
+                // Compute expected = current - grad using poly_subtract.
+                let (expected, _s_expected) = poly_subtract(current, grad, s_current, s_grad);
+
+                // Debug prints for activation 0, cell 0.
+                if j == 0 && i == 0 {
+                    println!("DEBUG for cell (0,0):");
+                    println!("  current = {:?}", current);
+                    println!("  grad = {:?}", grad);
+                    println!("  expected = {:?}", expected);
+                    println!("  next = {:?}", frame.next()[idx]);
+                    println!("  difference = {:?}", frame.next()[idx] - expected);
+                }
+
+
+                // Enforce constraint: frame.next()[idx] should equal expected.
                 result[idx] = frame.next()[idx] - expected;
             }
-            // For each bias cell: (index = ac*fe + j)
+            // For the bias cell (index = ac * fe + j):
             let bias_index = ac * fe + j;
+            println!("  Bias cell: current = {:?}, next = {:?}", 
+            frame.current()[bias_index], frame.next()[bias_index]);
             let current_bias = frame.current()[bias_index];
-            // Compute bias update: temp_bias = poly_divide(error, learning_rate, 0, 0)
-            let (temp_bias, s_temp_bias) = poly_divide(error_per_act[j], learning_rate, s_zero, s_zero);
-            let (expected_bias, _s_expected_bias) = poly_subtract(current_bias, temp_bias, s_zero, s_temp_bias);
+            let s_current_bias = s_zero;
+            // Divide error by learning_rate:
+            let (temp_bias, s_temp_bias) = poly_divide(error_vals[j], learning_rate, s_error_vals[j], s_zero);
+            // Compute expected_bias = current_bias - temp_bias using poly_subtract.
+            let (expected_bias, _s_expected_bias) = poly_subtract(current_bias, temp_bias, s_current_bias, s_temp_bias);
+            
+             // Debug print for bias cell for activation 0.
+            if j == 0 {
+                println!("DEBUG for bias cell of activation 0:");
+                println!("  current bias = {:?}", current_bias);
+                println!("  expected bias = {:?}", expected_bias);
+                println!("  next bias = {:?}", frame.next()[bias_index]);
+                println!("  difference = {:?}", frame.next()[bias_index] - expected_bias);
+            }
+            
             result[bias_index] = frame.next()[bias_index] - expected_bias;
         }
-        // For any extra state cells, enforce zero.
+        // For any extra state cells, enforce that they remain zero.
         for i in (ac * fe + ac)..result.len() {
             result[i] = E::from(f64_to_felt(0.0));
         }
     }
-    
+        
     fn get_assertions(&self) -> Vec<Assertion<Self::BaseField>> {
         let trace_len = self.trace_length();
         self.pub_inputs
@@ -306,4 +367,59 @@ impl Air for TrainingUpdateAir {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*; // Imports everything from this file
+    use winterfell::math::{fields::f128::BaseElement as Felt, StarkField};
+
+    // Helper: a function to compare two Felt values.
+    // You might prefer to use assert_eq! if Felt implements PartialEq.
+    fn assert_felt_eq(a: Felt, b: Felt) {
+        assert_eq!(a.as_int(), b.as_int(), "Expected {:?}, got {:?}", b, a);
+    }
+
+    #[test]
+    fn test_poly_add_zero_sign() {
+        // Use simple numbers.
+        let a = f64_to_felt(3.0);  // 3000000
+        let b = f64_to_felt(4.0);  // 4000000
+        let (res, s_res) = poly_add::<Felt>(a, b, Felt::ZERO, Felt::ZERO);
+        // Expected: a + b (with sign 0)
+        let expected = a + b;
+        assert_felt_eq(res, expected);
+        assert_eq!(s_res, Felt::ZERO, "Expected sign zero for poly_add");
+    }
+
+    #[test]
+    fn test_poly_subtract_zero_sign() {
+        let a = f64_to_felt(10.0); // 10e6
+        let b = f64_to_felt(4.0);  // 4e6
+        let (res, s_res) = poly_subtract::<Felt>(a, b, Felt::ZERO, Felt::ZERO);
+        let expected = a - b;
+        assert_felt_eq(res, expected);
+        assert_eq!(s_res, Felt::ZERO, "Expected sign zero for poly_subtract");
+    }
+
+    #[test]
+    fn test_poly_multiply_zero_sign() {
+        let a = f64_to_felt(3.0);
+        let b = f64_to_felt(4.0);
+        let (res, s_res) = poly_multiply::<Felt>(a, b, Felt::ZERO, Felt::ZERO);
+        let expected = a * b;
+        assert_felt_eq(res, expected);
+        assert_eq!(s_res, Felt::ZERO, "Expected sign zero for poly_multiply");
+    }
+
+    #[test]
+    fn test_poly_divide_zero_sign() {
+        // Let a = 12, b = 4.
+        let a = f64_to_felt(12.0);
+        let b = f64_to_felt(4.0);
+        // In normal arithmetic, 12/4 = 3 (all numbers are scaled by 1e6).
+        let (res, s_res) = poly_divide::<Felt>(a, b, Felt::ZERO, Felt::ZERO);
+        let expected = a / b;
+        assert_felt_eq(res, expected);
+        assert_eq!(s_res, Felt::ZERO, "Expected sign zero for poly_divide");
+    }
+}
 
