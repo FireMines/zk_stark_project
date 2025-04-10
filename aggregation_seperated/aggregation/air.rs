@@ -1,4 +1,6 @@
-use crate::helper::{f64_to_felt, AC, FE};
+// aggregation_seperated/aggregation/air.rs
+
+use crate::helper::{AC, FE};
 use winterfell::{
     Air, AirContext, Assertion, EvaluationFrame, ProofOptions, TraceInfo,
     TransitionConstraintDegree,
@@ -7,16 +9,25 @@ use winter_utils::Serializable;
 use winterfell::math::{FieldElement, ToElements};
 use winterfell::math::fields::f128::BaseElement as Felt;
 
-/// Public inputs for the aggregation circuit.
+/// The public inputs are masked old and new states plus a digest.
 #[derive(Clone)]
 pub struct GlobalUpdateInputs {
-    pub global_w: Vec<Vec<Felt>>,    // initial global weights [AC x FE]
-    pub global_b: Vec<Felt>,         // initial global biases [AC]
-    pub new_global_w: Vec<Vec<Felt>>, // aggregated (updated) global weights [AC x FE]
-    pub new_global_b: Vec<Felt>,      // aggregated (updated) global biases [AC]
-    pub k: Felt,                     // scaling factor (number of clients)
-    pub digest: Felt,                // MiMC hash digest (can be computed later)
-    pub steps: usize,                // number of update steps (uns‑padded rows)
+    // masked old state
+    pub global_w: Vec<Vec<Felt>>,
+    pub global_b: Vec<Felt>,
+
+    // masked new state
+    pub new_global_w: Vec<Vec<Felt>>,
+    pub new_global_b: Vec<Felt>,
+
+    // scaling factor (masked or unmasked? Usually unmasked, e.g. 8e6.)
+    pub k: Felt,
+
+    // a MiMC digest
+    pub digest: Felt,
+
+    // number of steps in the unpadded trace
+    pub steps: usize,
 }
 
 impl Serializable for GlobalUpdateInputs {
@@ -39,7 +50,7 @@ impl Serializable for GlobalUpdateInputs {
         }
         target.write(self.k);
         target.write(self.digest);
-        target.write(winterfell::math::fields::f128::BaseElement::new(self.steps as u128));
+        target.write(Felt::new(self.steps as u128));
     }
 }
 
@@ -64,45 +75,15 @@ impl ToElements<Felt> for GlobalUpdateInputs {
         }
         elems.push(self.k);
         elems.push(self.digest);
-        elems.push(winterfell::math::fields::f128::BaseElement::new(self.steps as u128));
+        elems.push(Felt::new(self.steps as u128));
         elems
     }
 }
 
-/// AIR for the aggregation circuit.
+/// The aggregator AIR verifying the masked iterative update.
 pub struct GlobalUpdateAir {
     pub context: AirContext<Felt>,
     pub pub_inputs: GlobalUpdateInputs,
-}
-
-impl GlobalUpdateAir {
-    /// Get the public initial state S₀ (flattened global weights then biases).
-    fn get_public_initial_state(&self) -> Vec<Felt> {
-        let mut state = Vec::new();
-        for i in 0..AC {
-            for j in 0..FE {
-                state.push(self.pub_inputs.global_w[i][j]);
-            }
-        }
-        for i in 0..AC {
-            state.push(self.pub_inputs.global_b[i]);
-        }
-        state
-    }
-
-    /// Get the aggregated state.
-    fn get_public_new_state(&self) -> Vec<Felt> {
-        let mut state = Vec::new();
-        for i in 0..AC {
-            for j in 0..FE {
-                state.push(self.pub_inputs.new_global_w[i][j]);
-            }
-        }
-        for i in 0..AC {
-            state.push(self.pub_inputs.new_global_b[i]);
-        }
-        state
-    }
 }
 
 impl Air for GlobalUpdateAir {
@@ -110,9 +91,10 @@ impl Air for GlobalUpdateAir {
     type PublicInputs = GlobalUpdateInputs;
 
     fn new(trace_info: TraceInfo, pub_inputs: GlobalUpdateInputs, options: ProofOptions) -> Self {
-        let width = (AC * FE + AC) * 2;
-        let degrees = vec![TransitionConstraintDegree::new(1); AC * FE + AC];
-        let context = AirContext::new(trace_info, degrees, width, options);
+        let d = AC * FE + AC;
+        let degrees = vec![TransitionConstraintDegree::new(1); d];
+        // total width = 2*d
+        let context = AirContext::new(trace_info, degrees, d * 2, options);
         Self { context, pub_inputs }
     }
 
@@ -124,11 +106,12 @@ impl Air for GlobalUpdateAir {
     ) {
         let d = AC * FE + AC;
         let c = E::from(self.pub_inputs.k);
+        // for i in 0..d, constraint is c*(S_{next} - S_{curr}) - U = 0
         for i in 0..d {
-            let current_state = frame.current()[i];
-            let next_state = frame.next()[i];
-            let update_raw = frame.next()[i + d];
-            result[i] = c * next_state - c * current_state - update_raw;
+            let curr = frame.current()[i];
+            let next = frame.next()[i];
+            let update = frame.next()[i + d];
+            result[i] = c * next - c * curr - update;
         }
         for i in d..result.len() {
             result[i] = E::ZERO;
@@ -137,14 +120,28 @@ impl Air for GlobalUpdateAir {
 
     fn get_assertions(&self) -> Vec<Assertion<Self::BaseField>> {
         let d = AC * FE + AC;
-        let new_state = self.get_public_new_state();
+        let final_state_flat = {
+            let mut buf = Vec::with_capacity(d);
+            for i in 0..AC {
+                for j in 0..FE {
+                    buf.push(self.pub_inputs.new_global_w[i][j]);
+                }
+            }
+            for i in 0..AC {
+                buf.push(self.pub_inputs.new_global_b[i]);
+            }
+            buf
+        };
         let last_row = self.pub_inputs.steps - 1;
+
         let mut assertions = Vec::new();
+        // S-part in last row must match masked final. 
         for i in 0..d {
-            assertions.push(Assertion::single(i, last_row, new_state[i]));
+            assertions.push(Assertion::single(i, last_row, final_state_flat[i]));
         }
-        for i in d..(2 * d) {
-            assertions.push(Assertion::single(i, last_row, Self::BaseField::ZERO));
+        // update part in last row must be zero.
+        for i in d..(2*d) {
+            assertions.push(Assertion::single(i, last_row, Felt::ZERO));
         }
         assertions
     }

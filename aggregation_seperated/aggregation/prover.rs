@@ -1,48 +1,41 @@
+// aggregation_seperated/aggregation/prover.rs
+
 use crate::aggregation::air::{GlobalUpdateAir, GlobalUpdateInputs};
-use crate::helper::{AC, FE, f64_to_felt, transpose};
+use crate::helper::{AC, FE, transpose, get_round_constants, mimc_hash_matrix};
 use winterfell::{
     AuxRandElements, CompositionPoly, CompositionPolyTrace, ConstraintCompositionCoefficients,
     DefaultConstraintCommitment, DefaultConstraintEvaluator, DefaultTraceLde, PartitionOptions, ProofOptions,
-    Prover, TraceInfo, TraceTable, TracePolyTable,
+    Prover, TraceInfo, TraceTable,
 };
 use winterfell::crypto::{hashers::Blake3_256, DefaultRandomCoin, MerkleTree};
 use winterfell::math::FieldElement;
 use winterfell::math::fields::f128::BaseElement as Felt;
+use rand::Rng;
 
 pub struct GlobalUpdateProver {
-    pub options: ProofOptions,
-    pub global_w: Vec<Vec<Felt>>,
-    pub global_b: Vec<Felt>,
-    pub local_w: Vec<Vec<Vec<Felt>>>, // [C][AC][FE]
-    pub local_b: Vec<Vec<Felt>>,      // [C][AC]
-    pub k: Felt,                    // scaling factor = number of clients
-    pub trace_length: usize,        // padded length (power-of-two, at least uns_padded_steps)
+    options: ProofOptions,
+
+    // real (unmasked) initial model
+    raw_global_w: Vec<Vec<Felt>>,
+    raw_global_b: Vec<Felt>,
+
+    // local updates
+    local_w: Vec<Vec<Vec<Felt>>>,
+    local_b: Vec<Vec<Felt>>,
+
+    k: Felt,
+    trace_length: usize,
+
+    // random blinding
+    blinding: Vec<Felt>,
+
+    // masked initial model
+    masked_global_w: Vec<Vec<Felt>>,
+    masked_global_b: Vec<Felt>,
 }
 
 impl GlobalUpdateProver {
-    pub fn new(
-        options: ProofOptions,
-        global_w: Vec<Vec<Felt>>,
-        global_b: Vec<Felt>,
-        local_w: Vec<Vec<Vec<Felt>>>,
-        local_b: Vec<Vec<Felt>>,
-        k: Felt,
-    ) -> Self {
-        // We now set uns_padded_steps to: 1 (initial row) + number of client updates + 1 extra final row.
-        let uns_padded_steps = local_w.len() + 2;
-        let padded_rows = uns_padded_steps.next_power_of_two().max(8);
-        Self {
-            options,
-            global_w,
-            global_b,
-            local_w,
-            local_b,
-            k,
-            trace_length: padded_rows,
-        }
-    }
-
-    /// Flatten state: weights then biases.
+    // Flatten / unflatten helpers
     fn flatten_state(w: &Vec<Vec<Felt>>, b: &Vec<Felt>) -> Vec<Felt> {
         let mut flat = Vec::new();
         for row in w {
@@ -51,117 +44,153 @@ impl GlobalUpdateProver {
         flat.extend_from_slice(b);
         flat
     }
+    fn unflatten_state(state: &[Felt], ac: usize, fe: usize) -> (Vec<Vec<Felt>>, Vec<Felt>) {
+        let weights: Vec<Vec<Felt>> = (0..ac)
+            .map(|i| state[i*fe..(i*fe+fe)].to_vec())
+            .collect();
+        let biases = state[(ac*fe)..].to_vec();
+        (weights, biases)
+    }
 
-    /// Build an augmented iterative trace.
-    ///
-    /// We "anchor" each client update to the fixed base state S₀ (the initial global model).
-    /// For each client update L, we compute:
-    ///
-    ///  δ = (L – S₀)/c,
-    ///
-    /// and update the accumulated state by:
-    ///
-    ///  S_next = S_current + δ.
-    ///
-    /// Each row is augmented as [S ‖ (L – S₀)].
-    /// Row 0 is [S₀ ‖ 0]. After processing all client updates, we add an extra row
-    /// [S_final ‖ 0] to serve as the final boundary.
+    pub fn new(
+        options: ProofOptions,
+        raw_global_w: Vec<Vec<Felt>>,
+        raw_global_b: Vec<Felt>,
+        local_w: Vec<Vec<Vec<Felt>>>,
+        local_b: Vec<Vec<Felt>>,
+        k: Felt,
+    ) -> Self {
+        let uns_padded_steps = local_w.len() + 2;
+        let padded_rows = uns_padded_steps.next_power_of_two().max(8);
+        let d = AC * FE + AC;
+
+        // sample a random blinding
+        let mut rng = rand::thread_rng();
+        let blinding: Vec<Felt> = (0..d).map(|_| {
+            let r: u64 = rng.gen();
+            Felt::new(r as u128)
+        }).collect();
+
+        // compute masked initial
+        let raw_flat = Self::flatten_state(&raw_global_w, &raw_global_b);
+        let masked_flat: Vec<Felt> = raw_flat.iter()
+            .zip(blinding.iter())
+            .map(|(raw_val, mask)| *raw_val + *mask)
+            .collect();
+        let (masked_global_w, masked_global_b) = Self::unflatten_state(&masked_flat, AC, FE);
+
+        Self {
+            options,
+            raw_global_w,
+            raw_global_b,
+            local_w,
+            local_b,
+            k,
+            trace_length: padded_rows,
+            blinding,
+            masked_global_w,
+            masked_global_b,
+        }
+    }
+
+    /// The masked iterative trace. row0 is the masked old model, row(i+1) = row(i) + delta
+    /// where delta = (L_i - raw_global) / c.
     pub fn compute_iterative_trace_augmented(&self) -> Vec<Vec<Felt>> {
         let num_transitions = self.local_w.len();
-        // uns_padded_steps = 1 (row 0) + num_transitions + 1 (extra final row)
         let uns_padded_steps = num_transitions + 2;
         let d_state = AC * FE + AC;
-        let mut trace_rows: Vec<Vec<Felt>> = Vec::with_capacity(uns_padded_steps);
 
-        // S₀ = initial global state.
-        let base_state = Self::flatten_state(&self.global_w, &self.global_b);
-        // Row 0: [S₀ ‖ 0]
-        let mut row0 = base_state.clone();
+        let mut trace_rows = Vec::with_capacity(uns_padded_steps);
+
+        // row0: [masked old model || 0]
+        let mut row0 = Self::flatten_state(&self.masked_global_w, &self.masked_global_b);
         row0.extend(vec![Felt::ZERO; d_state]);
-        trace_rows.push(row0);
+        trace_rows.push(row0.clone());
 
-        let c_val = self.k;
-        // Start with current state = S₀.
-        let mut current_state = base_state.clone();
+        let mut current_masked = Self::flatten_state(&self.masked_global_w, &self.masked_global_b);
 
-        // For each client update:
-        for client in 0..num_transitions {
-            // Compute L: client’s local model (flatten).
-            let local_w_flat: Vec<Felt> = self.local_w[client]
-                .iter()
-                .flat_map(|row| row.clone())
+        let raw_flat = Self::flatten_state(&self.raw_global_w, &self.raw_global_b);
+
+        for i in 0..num_transitions {
+            // Flatten local update
+            let local_w_flat: Vec<Felt> = self.local_w[i].iter().flat_map(|r| r.clone()).collect();
+            let mut l = local_w_flat;
+            l.extend(self.local_b[i].clone());
+
+            // compute delta = (L - raw_global) / c
+            let delta: Vec<Felt> = raw_flat.iter()
+                .zip(l.iter())
+                .map(|(g0, l)| (*l - *g0) / self.k)
                 .collect();
-            let mut L = local_w_flat;
-            L.extend(self.local_b[client].clone());
-            // Compute δ = (L – S₀)/c.
-            let delta: Vec<Felt> = base_state
-                .iter()
-                .zip(L.iter())
-                .map(|(b, l)| (*l - *b) / c_val)
-                .collect();
-            // Compute next state: S_next = current_state + δ.
-            let next_state: Vec<Felt> = current_state
-                .iter()
+
+            // next_masked = current_masked + delta
+            let next_masked: Vec<Felt> = current_masked.iter()
                 .zip(delta.iter())
-                .map(|(s, d)| *s + *d)
+                .map(|(cm, d)| *cm + *d)
                 .collect();
-            // In this row, store update U = (L – S₀).
-            let update_stored: Vec<Felt> = base_state
-                .iter()
-                .zip(L.iter())
-                .map(|(b, l)| *l - *b)
+
+            // the update portion is (L - raw_global)
+            let update_stored: Vec<Felt> = raw_flat.iter()
+                .zip(l.iter())
+                .map(|(g0, l)| *l - *g0)
                 .collect();
-            let mut augmented_row = next_state.clone();
-            augmented_row.extend(update_stored);
-            trace_rows.push(augmented_row);
-            current_state = next_state;
+
+            let mut row = next_masked.clone();
+            row.extend(update_stored);
+            trace_rows.push(row.clone());
+            current_masked = next_masked;
         }
 
-        // Add an extra row: [S_final ‖ 0] where S_final = current_state.
-        let extra_row = [current_state.clone(), vec![Felt::ZERO; d_state]].concat();
-        trace_rows.push(extra_row);
+        // final row: [S_final_masked || 0]
+        let extra_row = [current_masked.clone(), vec![Felt::ZERO; d_state]].concat();
+        trace_rows.push(extra_row.clone());
 
-        // Pad to reach trace_length.
+        // pad if needed
         while trace_rows.len() < self.trace_length {
-            let last_state = trace_rows.last().unwrap()[..d_state].to_vec();
-            let padded_row = [last_state, vec![Felt::ZERO; d_state]].concat();
-            trace_rows.push(padded_row);
+            let last = trace_rows.last().unwrap().clone();
+            trace_rows.push(last);
         }
         trace_rows
     }
 
-    /// Build the execution trace as a column-major matrix.
+    /// Build the trace table from the masked iterative rows
     pub fn build_trace(&self) -> TraceTable<Felt> {
         let trace_rows = self.compute_iterative_trace_augmented();
         TraceTable::init(transpose(trace_rows))
     }
 
-    /// Retrieve public inputs.
-    ///
-    /// The final aggregated state is taken from the S part of the final uns‑padded row.
+    /// Extract the masked final state -> masked old/new states in the public inputs
     pub fn get_pub_inputs(&self, _trace: &<GlobalUpdateProver as Prover>::Trace) -> GlobalUpdateInputs {
-        // uns_padded_steps = local_w.len() + 2.
-        let uns_padded_steps = self.local_w.len() + 2;
+        let num_transitions = self.local_w.len();
+        let uns_padded_steps = num_transitions + 2;
+
+        // the final row is the last unpadded row
         let trace_rows = self.compute_iterative_trace_augmented();
         let final_row = trace_rows[uns_padded_steps - 1].clone();
         let d_state = AC * FE + AC;
-        let new_global_w: Vec<Vec<Felt>> = final_row[..(AC * FE)]
-            .chunks(FE)
-            .map(|chunk| chunk.to_vec())
-            .collect();
-        let new_global_b: Vec<Felt> = final_row[(AC * FE)..d_state].to_vec();
+        let final_masked_state = &final_row[..d_state];
+
+        // unflatten the final masked
+        let (new_w_masked, new_b_masked) = Self::unflatten_state(final_masked_state, AC, FE);
+
+        // compute digest
+        let round_constants = get_round_constants();
+        let digest = mimc_hash_matrix(&new_w_masked, &new_b_masked, &round_constants);
+
+        // public old = masked_global_w, masked_global_b
         GlobalUpdateInputs {
-            global_w: self.global_w.clone(),
-            global_b: self.global_b.clone(),
-            new_global_w,
-            new_global_b,
+            global_w: self.masked_global_w.clone(),
+            global_b: self.masked_global_b.clone(),
+            new_global_w: new_w_masked,
+            new_global_b: new_b_masked,
             k: self.k,
-            digest: f64_to_felt(0.0),
+            digest,
             steps: uns_padded_steps,
         }
     }
 }
 
+// implement Prover trait for the aggregator as usual
 impl Prover for GlobalUpdateProver {
     type BaseField = Felt;
     type Air = GlobalUpdateAir;
