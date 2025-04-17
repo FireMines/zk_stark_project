@@ -1,4 +1,6 @@
 // src/helper.rs
+// helper.rs (prover side)
+pub use crate::signed::{add, sub as subtract, mul as multiply, div as divide};
 
 use std::error::Error;
 use csv::ReaderBuilder;
@@ -9,7 +11,7 @@ use winterfell::math::fields::f128::BaseElement as Felt;
 
 // Global constants (matching ZoKrates)
 // We hard-code the values to avoid calling non-const operators.
-const MAX: u128 = u128::MAX; // 340_282_366_920_938_463_463_374_607_431_768_211_455u128
+pub const MAX: u128 = u128::MAX; // 340_282_366_920_938_463_463_374_607_431_768_211_455u128
 const THRESHOLD: Felt = Felt::new(170141183460469231731687303715884105727); // about 2^127 - 1
 pub const AC: usize = 6; // number of activations (layers)
 const AC_F: Felt = Felt::new(6);
@@ -38,69 +40,21 @@ pub fn u32_to_field(x: u32) -> Felt {
 /// - If both operands have sign 1, compute c = (MAX + 1 - a_cleansed - b_cleansed),
 ///   else c = a + b.
 /// - Set the result’s sign to 1 if c > THRESHOLD, otherwise 0.
-pub fn add(a: Felt, b: Felt, a_sign: Felt, b_sign: Felt) -> (Felt, Felt) {
-    let a_cleansed = if a_sign == Felt::ZERO { a } else { Felt::new(MAX) - a + Felt::ONE };
-    let b_cleansed = if b_sign == Felt::ZERO { b } else { Felt::new(MAX) - b + Felt::ONE };
-    let c = if a_sign == b_sign && a_sign == Felt::ONE {
-        Felt::new(MAX) + Felt::ONE - a_cleansed - b_cleansed
+// helper.rs -------------------------------------------------------------
+
+pub const fn encode_signed(x: i128) -> (Felt, Felt) {
+    if x >= 0 {
+        (Felt::new(x as u128), Felt::ZERO)          //  +x
     } else {
-        a + b
-    };
-    let c_sign = if c.as_int() > THRESHOLD.as_int() { Felt::ONE } else { Felt::ZERO };
-    (c, c_sign)
+        let abs = (-x) as u128;
+        (Felt::new(MAX.wrapping_sub(abs).wrapping_add(1)), Felt::ONE)   //  -x
+    }
 }
 
-/// Signed subtraction with cleansing:
-/// - Cleanses each operand as in `add`.
-/// - If a_sign ≠ b_sign and a_sign == 0, then c = a_cleansed + b_cleansed,
-///   otherwise c = a - b.
-/// - The result’s sign is 1 if c > THRESHOLD, otherwise 0.
-pub fn subtract(a: Felt, b: Felt, a_sign: Felt, b_sign: Felt) -> (Felt, Felt) {
-    let a_cleansed = if a_sign == Felt::ZERO { a } else { Felt::new(MAX) - a + Felt::ONE };
-    let b_cleansed = if b_sign == Felt::ZERO { b } else { Felt::new(MAX) - b + Felt::ONE };
-    let c = if a_sign != b_sign && a_sign == Felt::ZERO {
-        a_cleansed + b_cleansed
-    } else {
-        a - b
-    };
-    let d = if c.as_int() > THRESHOLD.as_int() { Felt::ONE } else { Felt::ZERO };
-    (c, d)
-}
-
-/// Signed division with cleansing:
-/// - Cleanses both operands.
-/// - Converts them to u64 and adjusts a by subtracting its remainder modulo b.
-/// - Performs the division.
-/// - Sets the result’s sign to 0 if a_sign equals b_sign or the result is zero; otherwise 1.
-/// - If the sign is 1, computes the final result as (MAX + 1 - res).
-pub fn divide(a: Felt, b: Felt, a_sign: Felt, b_sign: Felt) -> (Felt, Felt) {
-    let a_cleansed = if a_sign == Felt::ZERO { a } else { Felt::new(MAX) - a + Felt::ONE };
-    let b_cleansed = if b_sign == Felt::ZERO { b } else { Felt::new(MAX) - b + Felt::ONE };
-
-    let a_u64 = a_cleansed.as_int() as u64;
-    let b_u64 = b_cleansed.as_int() as u64;
-    let remainder = a_u64 % b_u64;
-    let a_u64_adjusted = a_u64 - remainder;
-    let a_cleansed_adjusted = u64_to_field(a_u64_adjusted);
-
-    let res = a_cleansed_adjusted / b_cleansed;
-    let sign = if a_sign == b_sign || res == Felt::ZERO { Felt::ZERO } else { Felt::ONE };
-    let res_final = if sign == Felt::ZERO { res } else { Felt::new(MAX) + Felt::ONE - res };
-    (res_final, sign)
-}
-
-/// Signed multiplication with cleansing:
-/// - Cleanses each operand.
-/// - Multiplies the cleansed operands.
-/// - Sets the result’s sign to 0 if the original signs are equal or the product is zero; otherwise 1.
-/// - If the sign is 1, computes the final result as (MAX - res + 1).
-pub fn multiply(a: Felt, b: Felt, a_sign: Felt, b_sign: Felt) -> (Felt, Felt) {
-    let a_cleansed = if a_sign == Felt::ZERO { a } else { Felt::new(MAX) - a + Felt::ONE };
-    let b_cleansed = if b_sign == Felt::ZERO { b } else { Felt::new(MAX) - b + Felt::ONE };
-    let res = a_cleansed * b_cleansed;
-    let sign = if a_sign == b_sign || res == Felt::ZERO { Felt::ZERO } else { Felt::ONE };
-    let res_final = if sign == Felt::ZERO { res } else { Felt::new(MAX) - res + Felt::ONE };
-    (res_final, sign)
+/// scale f64 → (value, sign)
+pub fn f64_to_signed_felt(x: f64, scale: f64) -> (Felt, Felt) {
+    let scaled = (x * scale).round() as i128;
+    encode_signed(scaled)
 }
 
 
@@ -151,36 +105,44 @@ pub fn split_dataset(
 }
 
 /// Generates an initial model using a normal distribution (replicates Veriblock‑FL).
-pub fn generate_initial_model(input_dim: usize, output_dim: usize, precision: f64) -> (Vec<Vec<Felt>>, Vec<Felt>) {
-    let normal = Normal::new(0.0, precision / 5.0).unwrap();
-    let mut rng = thread_rng();
-    let weights: Vec<Vec<Felt>> = (0..output_dim)
-        .map(|_| {
-            (0..input_dim)
-                .map(|_| {
-                    let sample: f64 = normal.sample(&mut rng);
-                    f64_to_felt(sample)
-                })
-                .collect()
-        })
-        .collect();
-    let biases: Vec<Felt> = (0..output_dim)
-        .map(|_| {
-            let sample: f64 = normal.sample(&mut rng);
-            f64_to_felt(sample)
-        })
-        .collect();
-    (weights, biases)
+pub fn generate_initial_model(
+    fe: usize,
+    ac: usize,
+    sigma: f64                // standard‑dev in **original** real units
+) -> (Vec<Vec<Felt>>, Vec<Vec<Felt>>, Vec<Felt>, Vec<Felt>) {
+
+    let normal   = Normal::new(0.0, sigma).unwrap();
+    let mut rng  = thread_rng();
+
+    let mut w      = vec![vec![Felt::ZERO; fe]; ac];
+    let mut w_sign = vec![vec![Felt::ZERO; fe]; ac];
+    let mut b      = vec![Felt::ZERO; ac];
+    let mut b_sign = vec![Felt::ZERO; ac];
+
+    for j in 0..ac {
+        for i in 0..fe {
+            let (v, s) = f64_to_signed_felt(normal.sample(&mut rng), 1e6);
+            w[j][i] = v;  w_sign[j][i] = s;
+        }
+        let (v, s) = f64_to_signed_felt(normal.sample(&mut rng), 1e6);
+        b[j] = v;  b_sign[j] = s;
+    }
+    (w, w_sign, b, b_sign)
 }
 
 /// Converts a scalar label to a one‑hot vector of length AC.
-pub fn label_to_one_hot(label: f64, ac: usize, precision: f64) -> Vec<Felt> {
-    let mut one_hot = vec![f64_to_felt(0.0); ac];
+pub fn label_to_one_hot(label: f64, ac: usize, precision: f64)
+    -> (Vec<Felt>, Vec<Felt>)
+{
+    let mut v      = vec![Felt::ZERO; ac];
+    let mut v_sign = vec![Felt::ZERO; ac];
+
     let idx = if label < 1.0 { 0 } else { (label as usize).saturating_sub(1) };
     if idx < ac {
-        one_hot[idx] = f64_to_felt(precision);
+        let (val, sig) = f64_to_signed_felt(precision, 1.0);
+        v[idx] = val;  v_sign[idx] = sig;
     }
-    one_hot
+    (v, v_sign)
 }
 
 /// Flattens a weight matrix and bias vector into a single vector.
@@ -192,6 +154,22 @@ pub fn flatten_state_matrix(w: &Vec<Vec<Felt>>, b: &Vec<Felt>) -> Vec<Felt> {
     flat.extend_from_slice(b);
     flat
 }
+
+// when you flatten state into a row:
+pub fn flatten_with_sign(w: &[Vec<Felt>], w_sign: &[Vec<Felt>],
+        b: &[Felt], b_sign: &[Felt]) -> Vec<Felt> {
+    let mut v = Vec::with_capacity(2*(w.len()*w[0].len() + b.len()));
+    for (row, srow) in w.iter().zip(w_sign) {
+        for (&v_i, &s_i) in row.iter().zip(srow) {
+            v.push(v_i);   v.push(s_i);
+        }
+    }
+    for (&v_i, &s_i) in b.iter().zip(b_sign) {
+        v.push(v_i);  v.push(s_i);
+    }
+    v
+}
+
 
 /// Unflattens a state vector into a weight matrix and bias vector.
 /// Assumes that the first (AC * FE) elements are the weights (row‑major)
@@ -207,6 +185,62 @@ pub fn unflatten_state_matrix(
     let biases: Vec<Felt> = state[(ac * fe)..].to_vec();
     (weights, biases)
 }
+
+/// From a `[v0,s0,v1,s1,…]` row build (w, b) and their sign matrices.
+pub fn split_state_with_sign(
+    row: &[Felt], ac: usize, fe: usize,
+) -> (Vec<Vec<Felt>>, Vec<Felt>, Vec<Vec<Felt>>, Vec<Felt>) {
+
+    let mut w      = vec![vec![Felt::ZERO; fe]; ac];
+    let mut w_sign = vec![vec![Felt::ZERO; fe]; ac];
+    let mut b      = vec![Felt::ZERO; ac];
+    let mut b_sign = vec![Felt::ZERO; ac];
+
+    // weights ---------------------------------------------------------------
+    for j in 0..ac {
+        for i in 0..fe {
+            let idx = 2 * (j*fe + i);
+            w[j][i]      = row[idx];
+            w_sign[j][i] = row[idx + 1];
+        }
+    }
+    // biases ----------------------------------------------------------------
+    for j in 0..ac {
+        let idx = 2 * (ac*fe + j);
+        b[j]      = row[idx];
+        b_sign[j] = row[idx + 1];
+    }
+    (w, b, w_sign, b_sign)
+}
+
+
+/// Extract only the *values* (skip every second “sign” column) from a
+/// flattened `[val,sign,…]` row layout.
+///
+/// Returns `(weights, biases)` where
+/// * `weights` has shape `[ac][fe]`
+/// * `biases`  has length `ac`
+pub fn unflatten_values_only(
+    state: &[Felt],
+    ac: usize,
+    fe: usize,
+) -> (Vec<Vec<Felt>>, Vec<Felt>) {
+    let mut w = vec![vec![Felt::ZERO; fe]; ac];
+    let mut idx = 0;
+    for j in 0..ac {
+        for i in 0..fe {
+            w[j][i] = state[idx];     // take the value
+            idx += 2;                 // skip its sign
+        }
+    }
+    let mut b = vec![Felt::ZERO; ac];
+    for j in 0..ac {
+        b[j] = state[idx];
+        idx += 2;                     // skip sign
+    }
+    (w, b)
+}
+
 
 /// Transposes a 2D vector.
 pub fn transpose(matrix: Vec<Vec<Felt>>) -> Vec<Vec<Felt>> {
@@ -369,46 +403,56 @@ pub fn backward_propagation_layer(
     x_sign: &[Felt],
     output_error_sign: &[Felt],
 ) -> (Vec<Vec<Felt>>, Vec<Felt>, Vec<Vec<Felt>>, Vec<Felt>) {
-    // Determine dimensions: number of activations (ac) and features (fe).
+    // Determine dimensions: number of activations and number of features.
     let ac = b.len();
     let fe = x.len();
 
     // --- Update the Bias Vector ---
-    // For each activation unit, update the bias using:
-    //   b[i] = b[i] - (output_error[i] / learning_rate)   (with sign adjustments)
     for i in 0..ac {
-        // Divide the output error by the learning rate.
         let (temp, temp_sign) = divide(output_error[i], learning_rate, output_error_sign[i], Felt::ZERO);
-        // Subtract this result from the bias.
         let (new_b, new_b_sign) = subtract(b[i], temp, b_sign[i], temp_sign);
         b[i] = new_b;
         b_sign[i] = new_b_sign;
     }
 
     // --- Update the Weight Matrix ---
-    // For each feature and activation, update the weight using:
-    //   w[i][j] = w[i][j] - (( (output_error[i] * x[j]) / learning_rate ) / pr)
-    // with proper sign propagation.
     for j in 0..fe {
         for i in 0..ac {
-            // Multiply output error and input.
+            // Multiply the output error for activation i by x[j].
             let (prod, prod_sign) = multiply(output_error[i], x[j], output_error_sign[i], x_sign[j]);
-            // Divide by the learning rate.
+            // Divide the product by the learning rate.
             let (temp, temp_sign) = divide(prod, learning_rate, prod_sign, Felt::ZERO);
-            // Divide the result by pr (precision/scaling).
-            let (temp2, temp2_sign) = divide(temp, pr, temp_sign, Felt::ZERO);
-            // Subtract the computed gradient from the current weight.
-            let (new_w, new_w_sign) = subtract(w[i][j], temp2, w_sign[i][j], temp2_sign);
+            // Divide that result by pr (precision/scaling).
+            let (grad, grad_sign) = divide(temp, pr, temp_sign, Felt::ZERO);
+
+            // For debugging: Print detailed info for a specific cell,
+            // here choose activation 1, feature 0 (i==1, j==0) as an example.
+           /* if i == 2 && j == 0 {
+                let current_weight = w[i][j];
+                let (expected, _expected_sign) = subtract(current_weight, grad, w_sign[i][j], grad_sign);
+                println!("--- Detailed Debug for activation {}, feature {} ---", i, j);
+                println!("  current_weight = {:?}", current_weight.as_int());
+                println!("  x = {:?}", x[j].as_int());
+                println!("  prod = {:?}", prod.as_int());
+                println!("  temp = {:?}", temp.as_int());
+                println!("  grad = {:?}", grad.as_int());
+                println!("  expected new weight = {:?}", expected.as_int());
+            }*/
+            
+            // Subtract the gradient from the current weight.
+            let (new_w, new_w_sign) = subtract(w[i][j], grad, w_sign[i][j], grad_sign);
             w[i][j] = new_w;
             w_sign[i][j] = new_w_sign;
-        }
+                    }
     }
 
-    // Return the updated weights, biases, and their corresponding sign matrices.
     (w.clone(), b.clone(), w_sign.clone(), b_sign.clone())
 }
 
 
+pub fn get_round_constants() -> Vec<Felt> {
+    (1..=64).map(|i| f64_to_felt(i as f64)).collect()
+}
 
 
 /// Updates global weights and biases based on client-provided local updates.
@@ -552,4 +596,106 @@ pub fn mimc_hash_aggregator(w: &Vec<Vec<Felt>>, b: &Vec<Felt>, round_constants: 
         z = mimc_cipher(b[i], rc, z);
     }
     z
+}
+
+/// Convenience: convert a bool‑like Felt (0/1) into usize
+#[inline] pub fn felt_to_bool(f: Felt) -> bool { f == Felt::ONE }
+
+/// Enforce “bit” in the AIR:  s · (s − 1) = 0
+#[inline] pub fn bit_constraint<E: FieldElement>(s: E) -> E { s * (s - E::ONE) }
+
+
+
+#[cfg(test)]
+mod tests {
+    use super::*; // Imports everything from this file
+    use winterfell::math::{fields::f128::BaseElement as Felt, StarkField};
+
+    // Helper: a function to compare two Felt values.
+    // You might prefer to use assert_eq! if Felt implements PartialEq.
+    fn assert_felt_eq(a: Felt, b: Felt) {
+        assert_eq!(a.as_int(), b.as_int(), "Expected {:?}, got {:?}", b, a);
+    }
+
+    #[test]
+    fn test_add_zero_sign() {
+        // Use simple numbers.
+        let a = f64_to_felt(3.0);  // 3000000
+        let b = f64_to_felt(4.0);  // 4000000
+        let (res, s_res) = add(a, b, Felt::ZERO, Felt::ZERO);
+        // Expected: a + b (with sign 0)
+        let expected = a + b;
+        assert_felt_eq(res, expected);
+        assert_eq!(s_res, Felt::ZERO, "Expected sign zero for add");
+    }
+
+    #[test]
+    fn test_subtract_zero_sign() {
+        let a = f64_to_felt(10.0); // 10e6
+        let b = f64_to_felt(4.0);  // 4e6
+        let (res, s_res) = subtract(a, b, Felt::ZERO, Felt::ZERO);
+        let expected = a - b;
+        assert_felt_eq(res, expected);
+        assert_eq!(s_res, Felt::ZERO, "Expected sign zero for subtract");
+    }
+
+    #[test]
+    fn test_multiply_zero_sign() {
+        let a = f64_to_felt(3.0);
+        let b = f64_to_felt(4.0);
+        let (res, s_res) = multiply(a, b, Felt::ZERO, Felt::ZERO);
+        let expected = a * b;
+        assert_felt_eq(res, expected);
+        assert_eq!(s_res, Felt::ZERO, "Expected sign zero for multiply");
+    }
+
+    #[test]
+    fn test_divide_zero_sign() {
+        // Let a = 12, b = 4.
+        let a = f64_to_felt(12.0);
+        let b = f64_to_felt(4.0);
+        // In normal arithmetic, 12/4 = 3 (all numbers are scaled by 1e6).
+        let (res, s_res) = divide(a, b, Felt::ZERO, Felt::ZERO);
+        let expected = a / b;
+        assert_felt_eq(res, expected);
+        assert_eq!(s_res, Felt::ZERO, "Expected sign zero for divide");
+    }
+
+
+    // A helper function to create a simple matrix and bias vector.
+    fn example_state() -> (Vec<Vec<Felt>>, Vec<Felt>) {
+        // For example, create a 2x3 weight matrix and a bias vector of length 2.
+        // (Make sure to use your f64_to_felt conversion or direct `Felt::new`.)
+        let w = vec![
+            vec![Felt::new(1), Felt::new(2), Felt::new(3)],
+            vec![Felt::new(4), Felt::new(5), Felt::new(6)],
+        ];
+        let b = vec![Felt::new(7), Felt::new(8)];
+        (w, b)
+    }
+
+    #[test]
+    fn test_flatten_unflatten() {
+        let (w, b) = example_state();
+        let flat = flatten_state_matrix(&w, &b);
+        let (w2, b2) = unflatten_state_matrix(&flat, 2, 3); // 2 activations, 3 features
+        assert_eq!(w, w2, "Unflattened weight matrix does not match the original");
+        assert_eq!(b, b2, "Unflattened bias vector does not match the original");
+    }
+
+    #[test]
+    fn test_transpose() {
+        // Create a simple 2x3 matrix.
+        let matrix = vec![
+            vec![Felt::new(1), Felt::new(2), Felt::new(3)],
+            vec![Felt::new(4), Felt::new(5), Felt::new(6)],
+        ];
+        let expected_transpose = vec![
+            vec![Felt::new(1), Felt::new(4)],
+            vec![Felt::new(2), Felt::new(5)],
+            vec![Felt::new(3), Felt::new(6)],
+        ];
+        let t = transpose(matrix);
+        assert_eq!(t, expected_transpose, "Transpose function did not produce the expected result");
+    }
 }

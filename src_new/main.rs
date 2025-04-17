@@ -1,6 +1,7 @@
 // src/main.rs
 
 mod helper;
+mod signed;
 mod aggregation {
     pub mod air;
     pub mod prover;
@@ -63,15 +64,22 @@ fn main() -> Result<(), Box<dyn Error>> {
             .into());
         }
         let x: Vec<Felt> = sample.iter().map(|&v| f64_to_felt(v)).collect();
-        let x_sign: Vec<Felt> = vec![f64_to_felt(0.0); x.len()];
+        let x_sign: Vec<Felt> = vec![Felt::ZERO; FE];
         let label_val = client_labels[0];
-        let y: Vec<Felt> = label_to_one_hot(label_val, AC, 1e6);
-        let (init_w, init_b) = generate_initial_model(FE, AC, 10000.0);
-        let learning_rate = f64_to_felt(0.0001);
+        let (y, y_sign) = label_to_one_hot(label_val, AC, 1e6);
+        let (init_w, init_w_sign, init_b, init_b_sign) =
+        generate_initial_model(FE, AC, 1.0 /* sigma */);        let learning_rate = f64_to_felt(0.0001);
         let precision = f64_to_felt(1e6);
         // For training the prover, initialize sign vectors (we assume default 0).
-        let w_sign: Vec<Vec<Felt>> = vec![vec![f64_to_felt(0.0); FE]; AC];
-        let b_sign: Vec<Felt> = vec![f64_to_felt(0.0); AC];
+        let w_sign  = vec![vec![Felt::ZERO; FE]; AC];
+        let b_sign: Vec<Felt> = vec![Felt::ZERO; AC];
+
+        assert_eq!(x.len(), FE);
+        assert_eq!(x_sign.len(), FE);
+        assert_eq!(w_sign.len(), AC);
+        assert!(w_sign.iter().all(|row| row.len() == FE));
+        assert_eq!(b_sign.len(), AC);
+
 
         let start = Instant::now();
 
@@ -123,12 +131,12 @@ fn main() -> Result<(), Box<dyn Error>> {
         "Average client update time: {} ms",
         total_client_time / (client_data.len() as u128)
     );
-
+/*
     // --- GLOBAL UPDATE: FedAvg Aggregation ---
     println!("\n--- Global Update Example ---");
     let (global_w, global_b) = generate_initial_model(FE, AC, 10000.0);
-    let global_w_sign: Vec<Vec<Felt>> = vec![vec![f64_to_felt(0.0); FE]; AC];
-    let global_b_sign: Vec<Felt> = vec![f64_to_felt(0.0); AC];
+    let global_w_sign: Vec<Vec<Felt>> = vec![vec![Felt::ZERO; FE]; AC];
+    let global_b_sign: Vec<Felt> = vec![Felt::ZERO; AC];
 
     let mut local_w = Vec::new();
     let mut local_w_sign = Vec::new();
@@ -139,11 +147,11 @@ fn main() -> Result<(), Box<dyn Error>> {
         let client_w_mat: Vec<Vec<Felt>> = vec![vec![f64_to_felt(client_val); FE]; AC];
         let client_w_sign_mat: Vec<Vec<Felt>> = client_w_mat
             .iter()
-            .map(|row| row.iter().map(|_| f64_to_felt(0.0)).collect())
+            .map(|row| row.iter().map(|_| Felt::ZERO).collect())
             .collect();
         let client_b_vec: Vec<Felt> = vec![f64_to_felt(client_val); AC];
         let client_b_sign_vec: Vec<Felt> =
-            client_b_vec.iter().map(|_| f64_to_felt(0.0)).collect();
+            client_b_vec.iter().map(|_| Felt::ZERO).collect();
         local_w.push(client_w_mat);
         local_w_sign.push(client_w_sign_mat);
         local_b.push(client_b_vec);
@@ -308,6 +316,6 @@ fn main() -> Result<(), Box<dyn Error>> {
     } else {
         println!("Final result: global model aggregation hash does not match expected digest.");
     }
-
+ */
     Ok(())
 }
