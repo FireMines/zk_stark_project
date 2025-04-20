@@ -138,9 +138,10 @@ fn main() -> Result<(), Box<dyn Error>> {
             .expect("training proof failed!");
         println!("  ↳ client {:>2} verified OK\n", i+1);
 
-        // collect the single‐coordinate update
-        client_reps.push(train_pub.final_state[0]);
-    }
+        // collect the single‐coordinate update from the *raw* trace’s last row
+        let last_row = train_trace.length() - 1;
+        let update = train_trace.get(0, last_row);
+        client_reps.push(update);    }
 
     //------------------------------------------------------------
     // 4) Build local_w, local_b from those scalars

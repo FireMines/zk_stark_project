@@ -190,7 +190,12 @@ pub fn unflatten_state_matrix(
 pub fn split_state_with_sign(
     row: &[Felt], ac: usize, fe: usize,
 ) -> (Vec<Vec<Felt>>, Vec<Felt>, Vec<Vec<Felt>>, Vec<Felt>) {
-
+    let expected = 2 * ac * (fe + 1);
+    assert_eq!(
+        row.len(), expected,
+        "split_state_with_sign: expected row.len() = {}, got {}",
+        expected, row.len()
+    );
     let mut w      = vec![vec![Felt::ZERO; fe]; ac];
     let mut w_sign = vec![vec![Felt::ZERO; fe]; ac];
     let mut b      = vec![Felt::ZERO; ac];
