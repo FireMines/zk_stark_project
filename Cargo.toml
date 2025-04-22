@@ -4,8 +4,8 @@ version = "0.1.0"
 edition = "2021"
 
 [[bin]]
-name = "vdf"
-path = "aggregation_seperated/main.rs"
+name = "stark_aggregator"
+path = "src_new/main.rs"
 
 [dependencies]
 winterfell = { version = "0.12", features = ["concurrent"] }
@@ -16,6 +16,9 @@ hex = "0.4"
 csv = "1.1"
 serde = { version = "1.0", features = ["derive"] }
 sysinfo = "0.26"        # For memory measurements
+structopt = "0.3"
+ark-ff = "0.4"
+ark-bls12-381 = "0.4"
 
 [dev-dependencies]
 criterion = "0.4"
