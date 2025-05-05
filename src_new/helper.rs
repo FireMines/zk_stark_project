@@ -286,43 +286,62 @@ pub fn mimc_hash_matrix(w: &[Vec<Felt>], b: &[Felt], round_constants: &[Felt]) -
     z
 }
 
-/// Computes the derivative of the mean squared error (MSE′) for a layer.
-///
-/// # Parameters
-/// - `y_true`: True output vector (length ac)
-/// - `y_pred`: Predicted output vector (length ac)
-/// - `y_pred_sign`: Sign vector for the predicted outputs (length ac)
-/// - `pr`: A precision or scaling parameter (unused in this function body)
-///
-/// # Returns
-/// A tuple `(result, result_sign)` representing the gradient with respect to y_pred.
+/// Mini‑batch MSE gradient dL/dy, returns (batch_size*AC) entries
 pub fn mse_prime(
     y_true: &[Felt],
     y_pred: &[Felt],
     y_pred_sign: &[Felt],
-    pr: Felt,
+    precision: Felt,
 ) -> (Vec<Felt>, Vec<Felt>) {
-    let ac = y_true.len();
-    // Represent the number of activations as a field element.
-    let ac_f = f64_to_felt(ac as f64);
+    let ac = AC;
+    let total = y_true.len();
+    assert_eq!(total % ac, 0, "Input must be a multiple of AC");
+    let batch_size = total / ac;
 
-    let mut result = vec![Felt::ZERO; ac];
-    let mut result_sign = vec![Felt::ZERO; ac];
+    // Convert AC to a field element
+    let ac_f = Felt::new(ac as u128);
 
-    for i in 0..ac {
-        // Compute the difference: (y_pred - y_true)
-        let (temp, temp_sign) = subtract(y_pred[i], y_true[i], y_pred_sign[i], Felt::ZERO);
-        // Multiply the difference by 2: 2 * (y_pred - y_true)
-        let (temp2, temp2_sign) = multiply(temp, f64_to_felt(2.0), temp_sign, Felt::ZERO);
-        // Divide by the number of activations: [2 * (y_pred - y_true)] / ac_f
-        let (res, res_sign) = divide(temp2, ac_f, temp2_sign, Felt::ZERO);
-        result[i] = res;
-        result_sign[i] = res_sign;
+    // Allocate outputs
+    let mut grad = vec![Felt::ZERO; total];
+    let mut grad_s = vec![Felt::ZERO; total];
+
+    // For each sample and activation
+    for i in 0..batch_size {
+        let base = i * ac;
+        for j in 0..ac {
+            let idx = base + j;
+            
+            // y_pred - y_true (with sign handling)
+            let (d, d_s) = subtract(
+                y_pred[idx % y_pred.len()],
+                y_true[idx % y_true.len()],
+                y_pred_sign[idx % y_pred_sign.len()],
+                Felt::ZERO, // Assuming y_true is always positive
+            );
+            
+            // 2 * d (for MSE derivative)
+            let (d2, d2_s) = multiply(
+                d,
+                f64_to_felt(2.0),
+                d_s,
+                Felt::ZERO,
+            );
+            
+            // d2 / AC
+            let (d3, d3_s) = divide(
+                d2,
+                ac_f,
+                d2_s,
+                Felt::ZERO,
+            );
+            
+            grad[idx] = d3;
+            grad_s[idx] = d3_s;
+        }
     }
 
-    (result, result_sign)
+    (grad, grad_s)
 }
-
 
 /// Computes a forward propagation layer.
 /// 
@@ -454,6 +473,126 @@ pub fn backward_propagation_layer(
     (w.clone(), b.clone(), w_sign.clone(), b_sign.clone())
 }
 
+
+/// Runs your existing `forward_propagation_layer` over a mini‐batch and returns
+/// the average output (and sign) across the batch.
+pub fn forward_propagation_batch(
+    w: &[Vec<Felt>],
+    b: &[Felt],
+    w_sign: &[Vec<Felt>],
+    b_sign: &[Felt],
+    x_sign: &[Felt],
+    x: &[Felt],         // flattened batch of size batch_size * fe
+    batch_size: usize,
+    precision: Felt,    // this is your `pr` parameter
+) -> (Vec<Felt>, Vec<Felt>) {
+    let fe = x.len() / batch_size;
+    // accumulator
+    let mut sum_out = vec![Felt::ZERO; b.len()];
+    let mut sum_out_s = vec![Felt::ZERO; b.len()];
+
+    for i in 0..batch_size {
+        let xs    = &x[i * fe .. (i+1) * fe];
+        let xss   = &x_sign[i * fe .. (i+1) * fe];
+        // call exactly your existing helper
+        let (out, out_s) = forward_propagation_layer(
+            w, b, xs,
+            w_sign, b_sign, xss,
+            precision,
+        );
+        for j in 0..out.len() {
+            sum_out[j]   += out[j];
+            sum_out_s[j] += out_s[j];
+        }
+    }
+
+    // divide by batch_size in-field
+    let inv_bs = Felt::from(batch_size as u32).inv();
+    for j in 0..sum_out.len() {
+        sum_out[j]   *= inv_bs;
+        sum_out_s[j] *= inv_bs;
+    }
+
+    (sum_out, sum_out_s)
+}
+
+/// Runs your existing `backward_propagation_layer` over a mini‐batch and returns
+/// the averaged gradients (∆w, ∆b and their sign‐matrices) across the batch.
+pub fn backward_propagation_batch(
+    w: &[Vec<Felt>],
+    b: &[Felt],
+    w_sign: &[Vec<Felt>],
+    b_sign: &[Felt],
+    x_sign: &[Felt],
+    x: &[Felt],         // flattened batch of size batch_size * fe
+    err_sign: &[Felt],
+    err: &[Felt],       // flattened batch of size batch_size * ac
+    batch_size: usize,
+    learning_rate: Felt,
+    precision: Felt,
+) -> (Vec<Vec<Felt>>, Vec<Felt>, Vec<Vec<Felt>>, Vec<Felt>) {
+    let ac = b.len();
+    let fe = x.len() / batch_size;
+
+    // accumulators
+    let mut sum_dw   = vec![vec![Felt::ZERO; fe]; ac];
+    let mut sum_db   = vec![Felt::ZERO; ac];
+    let mut sum_dw_s = vec![vec![Felt::ZERO; fe]; ac];
+    let mut sum_db_s = vec![Felt::ZERO; ac];
+
+    for i in 0..batch_size {
+        let xs    = &x[i * fe .. (i+1) * fe];
+        let xss   = &x_sign[i * fe .. (i+1) * fe];
+        // if err only has one AC‐block, always use that; else slice out the i’th chunk
+        let err_i = if err.len() == ac {
+            &err[..ac]
+            } else {
+            &err[i * ac .. (i+1) * ac]
+            };
+            let err_s = if err_sign.len() == ac {
+            &err_sign[..ac]
+            } else {
+            &err_sign[i * ac .. (i+1) * ac]
+        };
+        // we need owned Vecs for backward…but we don’t want to mutate your originals,
+        // so clone them into locals
+        let mut w_loc      = w.to_vec();
+        let mut b_loc      = b.to_vec();
+        let mut w_sign_loc = w_sign.to_vec();
+        let mut b_sign_loc = b_sign.to_vec();
+
+        // call your existing helper:
+        let (dw, db, dw_s, db_s) = backward_propagation_layer(
+            &mut w_loc, &mut b_loc,
+            xs, err_i,
+            learning_rate, precision,
+            &mut w_sign_loc, &mut b_sign_loc,
+            xss, err_s,
+        );
+
+        for a in 0..ac {
+            sum_db[a]   += db[a];
+            sum_db_s[a] += db_s[a];
+            for f in 0..fe {
+                sum_dw[a][f]   += dw[a][f];
+                sum_dw_s[a][f] += dw_s[a][f];
+            }
+        }
+    }
+
+    // divide by batch_size in-field
+    let inv_bs = Felt::from(batch_size as u32).inv();
+    for a in 0..ac {
+        sum_db[a]   *= inv_bs;
+        sum_db_s[a] *= inv_bs;
+        for f in 0..fe {
+            sum_dw[a][f]   *= inv_bs;
+            sum_dw_s[a][f] *= inv_bs;
+        }
+    }
+
+    (sum_dw, sum_db, sum_dw_s, sum_db_s)
+}
 
 pub fn get_round_constants() -> Vec<Felt> {
     (1..=64).map(|i| f64_to_felt(i as f64)).collect()

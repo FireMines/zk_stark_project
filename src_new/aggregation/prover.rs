@@ -155,10 +155,12 @@ impl GlobalUpdateProver {
 
     /// Build the trace table from the masked iterative rows
     pub fn build_trace(&self) -> TraceTable<Felt> {
+        println!("Building aggregation trace for {} clients...", self.local_w.len());
         let trace_rows = self.compute_iterative_trace_augmented();
+        println!("Aggregation trace built: {} rows", trace_rows.len());
         TraceTable::init(transpose(trace_rows))
     }
-
+    
     /// Extract the masked final state -> masked old/new states in the public inputs
     pub fn get_pub_inputs(&self, _trace: &<GlobalUpdateProver as Prover>::Trace) -> GlobalUpdateInputs {
         let num_transitions = self.local_w.len();
