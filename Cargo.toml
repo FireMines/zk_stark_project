@@ -24,7 +24,7 @@ ark-bls12-381 = "0.4"
 criterion = "0.4"
 
 [lib]
-path = "aggregation_seperated/lib.rs"
+path = "src/lib.rs"
 
 
 # Explicitly add funty to resolve version issues
