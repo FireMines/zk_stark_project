@@ -4,8 +4,8 @@ version = "0.1.0"
 edition = "2021"
 
 [[bin]]
-name = "stark_aggregator"
-path = "src_new/main.rs"
+name = "zk_stark_project"
+path = "src/main.rs"
 
 [dependencies]
 winterfell = { version = "0.12", features = ["concurrent"] }

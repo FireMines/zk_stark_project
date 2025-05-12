@@ -186,13 +186,13 @@ def setup_stark_environment(batch_size: int, num_devices: int = 3):
     build_time, build_mem_samples, build_max_mem = build_stark()
     
     # Find the binary path
-    rust_binary = "../target/release/zk_stark_project"
+    rust_binary = "../../target/release/zk_stark_project"
     if not os.path.exists(rust_binary):
         # Try alternative names
         alternative_paths = [
-            "../target/release/stark_aggregator",
-            "../target/release/main",
-            "../target/release/zk-stark-project"
+            "../../target/release/stark_aggregator",
+            "../../target/release/main",
+            "../../target/release/zk-stark-project"
         ]
         for alt_path in alternative_paths:
             if os.path.exists(alt_path):
@@ -237,7 +237,7 @@ def run_stark_benchmark(batch_size: int):
 # --------------------------------------------------------------------------------
 if __name__ == "__main__":
     # Read batch size from root.zok
-    batch = 1
+    batch = 40
     try:
         with open("../zokrates/root.zok") as f:
             for L in f:
