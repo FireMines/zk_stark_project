@@ -34,6 +34,12 @@ pub struct TrainingUpdateInputs {
 
 impl Serializable for TrainingUpdateInputs {
     fn write_into<W: ByteWriter>(&self, target: &mut W) {
+        // DEBUG: Log serialization
+        println!("DEBUG: TrainingUpdateInputs::write_into called");
+        println!("  - batch_size: {}", self.batch_size);
+        println!("  - x_batch.len(): {}", self.x_batch.len());
+        println!("  - y_batch.len(): {}", self.y_batch.len());
+        
         // write masked initial, masked final, then steps
         for &v in &self.initial_masked {
             target.write(v);
@@ -63,6 +69,9 @@ impl Serializable for TrainingUpdateInputs {
 
 impl ToElements<Felt> for TrainingUpdateInputs {
     fn to_elements(&self) -> Vec<Felt> {
+        // DEBUG: Log to_elements
+        println!("DEBUG: TrainingUpdateInputs::to_elements called");
+        
         let mut v = self.initial_masked.clone();
         v.extend(self.final_masked.iter());
         v.push(f64_to_felt(self.steps as f64));
@@ -78,6 +87,8 @@ impl ToElements<Felt> for TrainingUpdateInputs {
         
         v.push(self.learning_rate);
         v.push(self.precision);
+        
+        println!("  - total elements: {}", v.len());
         v
     }
 }
@@ -94,13 +105,38 @@ impl Air for TrainingUpdateAir {
     fn new(ti: TraceInfo, pub_inputs: TrainingUpdateInputs, opt: ProofOptions) -> Self {
         let width = ti.width();
         let degrees = vec![TransitionConstraintDegree::new(1); width];
-        Self { ctx: AirContext::new(ti, degrees, width, opt), pub_inputs }
+        
+        // DEBUG: Log AIR creation
+        println!("DEBUG: TrainingUpdateAir::new called");
+        println!("  - trace width: {}", width);
+        println!("  - trace length: {}", ti.length());
+        println!("  - pub_inputs.batch_size: {}", pub_inputs.batch_size);
+        println!("  - pub_inputs.steps: {}", pub_inputs.steps);
+        println!("  - pub_inputs.x_batch.len(): {}", pub_inputs.x_batch.len());
+        println!("  - pub_inputs.y_batch.len(): {}", pub_inputs.y_batch.len());
+        
+        // Validate that batch size matches the data
+        assert_eq!(pub_inputs.x_batch.len(), pub_inputs.batch_size,
+                   "x_batch size doesn't match batch_size in public inputs");
+        assert_eq!(pub_inputs.y_batch.len(), pub_inputs.batch_size,
+                   "y_batch size doesn't match batch_size in public inputs");
+        
+        Self { 
+            ctx: AirContext::new(ti, degrees, width, opt), 
+            pub_inputs,
+        }
     }
 
     fn get_assertions(&self) -> Vec<Assertion<Felt>> {
         let width = self.ctx.trace_info().width() / 2; // half is masked state
         let n = self.ctx.trace_len() - 1;
         let mut assertions = Vec::with_capacity(width * 2);
+        
+        // DEBUG: Log assertions
+        println!("DEBUG: TrainingUpdateAir::get_assertions called");
+        println!("  - width (half trace): {}", width);
+        println!("  - final step (n): {}", n);
+        
         // assert masked initial at row 0
         for i in 0..width {
             assertions.push(Assertion::single(i, 0, self.pub_inputs.initial_masked[i]));
@@ -109,6 +145,8 @@ impl Air for TrainingUpdateAir {
         for i in 0..width {
             assertions.push(Assertion::single(i, n, self.pub_inputs.final_masked[i]));
         }
+        
+        println!("  - total assertions: {}", assertions.len());
         assertions
     }
 
@@ -125,9 +163,27 @@ impl Air for TrainingUpdateAir {
         // Get current step (0-indexed)
         let current_step = frame.current_step();
         
+        // DEBUG: Log constraint evaluation for first few steps
+        if current_step <= 5 || (current_step <= self.pub_inputs.batch_size && current_step % 10 == 0) {
+            println!("DEBUG: evaluate_transition for step {} (batch_size: {})", 
+                     current_step, self.pub_inputs.batch_size);
+        }
+        
         // Only apply training constraints for steps within batch size
         if current_step > 0 && current_step <= self.pub_inputs.batch_size {
             let sample_idx = current_step - 1;
+            
+            // DEBUG: Log constraint application
+            if sample_idx < 5 {
+                println!("DEBUG: Applying constraints for step {} (sample {})", 
+                         current_step, sample_idx);
+            }
+            
+            // Validate sample index
+            if sample_idx >= self.pub_inputs.x_batch.len() {
+                panic!("Sample index {} out of bounds for x_batch (len: {})", 
+                       sample_idx, self.pub_inputs.x_batch.len());
+            }
             
             // Get dimensions for this sample
             let fe = self.pub_inputs.x_batch[sample_idx].len();
@@ -219,6 +275,13 @@ impl Air for TrainingUpdateAir {
             // For steps outside batch processing, maintain state (no constraints)
             for i in 0..result.len() {
                 result[i] = E::ZERO;
+            }
+            
+            // DEBUG: Log when no constraints are applied
+            if current_step == self.pub_inputs.batch_size + 1 || 
+               (current_step > self.pub_inputs.batch_size && current_step <= self.pub_inputs.batch_size + 5) {
+                println!("DEBUG: No constraints applied for step {} (beyond batch_size {})", 
+                         current_step, self.pub_inputs.batch_size);
             }
         }
     }

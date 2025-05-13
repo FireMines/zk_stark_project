@@ -47,6 +47,14 @@ impl TrainingUpdateProver {
         let ac = initial_b.len();
         let fe = initial_w[0].len();
         
+        // DEBUG: Enhanced validation and logging
+        println!("DEBUG: TrainingUpdateProver::new called with:");
+        println!("  - batch_size: {}", batch_size);
+        println!("  - x_batch.len(): {}", x_batch.len());
+        println!("  - x_batch_sign.len(): {}", x_batch_sign.len());
+        println!("  - y_batch.len(): {}", y_batch.len());
+        println!("  - ac: {}, fe: {}", ac, fe);
+        
         // Validate inputs
         assert_eq!(x_batch.len(), batch_size, "x_batch size doesn't match batch_size");
         assert_eq!(x_batch_sign.len(), batch_size, "x_batch_sign size doesn't match batch_size");
@@ -55,6 +63,12 @@ impl TrainingUpdateProver {
         let state_cells = ac * fe + ac;
         // Trace length needs to accommodate batch processing
         let trace_length = (2 * state_cells * batch_size).next_power_of_two().max(16);
+        
+        // DEBUG: Log trace length calculation
+        println!("DEBUG: Trace length calculation:");
+        println!("  - state_cells: {}", state_cells);
+        println!("  - 2 * state_cells * batch_size: {}", 2 * state_cells * batch_size);
+        println!("  - trace_length (next power of 2): {}", trace_length);
 
         Self {
             options,
@@ -74,10 +88,18 @@ impl TrainingUpdateProver {
 
     /// Build the masked trace for batch processing
     pub fn build_trace(&self) -> TraceTable<Felt> {
+        println!("DEBUG: build_trace() called");
+        println!("  - self.batch_size: {}", self.batch_size);
+        println!("  - self.trace_length: {}", self.trace_length);
+        
         let ac = self.initial_b.len();
         let fe = self.initial_w[0].len();
         let state_cells = ac * fe + ac;
         let flat_len = state_cells * 2;
+
+        println!("  - ac: {}, fe: {}", ac, fe);
+        println!("  - state_cells: {}", state_cells);
+        println!("  - flat_len: {}", flat_len);
 
         // flatten raw initial [v0,s0,v1,s1,…]
         let mut raw = Vec::with_capacity(flat_len);
@@ -103,9 +125,12 @@ impl TrainingUpdateProver {
             .map(|(r, m)| *r + *m)
             .collect::<Vec<_>>();
 
-        let mut rows = Vec::with_capacity(self.trace_length);
+        let mut rows: Vec<Vec<Felt>> = Vec::with_capacity(self.trace_length);
         // push row 0 = [masked || mask]
         rows.push(masked.iter().chain(mask.iter()).cloned().collect());
+
+        // DEBUG: Track batch processing
+        let mut samples_processed = 0;
 
         // Process batch samples sequentially within the trace
         for step in 1..self.trace_length {
@@ -116,6 +141,13 @@ impl TrainingUpdateProver {
             // Process one sample from the batch if within batch size
             if step <= self.batch_size {
                 let sample_idx = step - 1;
+                samples_processed += 1;
+                
+                // DEBUG: Log each sample processing
+                if samples_processed <= 5 || samples_processed % 10 == 0 {
+                    println!("DEBUG: Processing sample {} of {} (step {})", 
+                             samples_processed, self.batch_size, step);
+                }
                 
                 // forward pass for this sample
                 let (out, out_s) = forward_propagation_layer(
@@ -167,7 +199,22 @@ impl TrainingUpdateProver {
             rows.push(masked.iter().chain(mask.iter()).cloned().collect());
         }
 
-        TraceTable::init(transpose(rows))
+        println!("DEBUG: Total samples processed: {}", samples_processed);
+        println!("DEBUG: Total rows generated: {}", rows.len());
+        println!("DEBUG: Row width: {}", rows[0].len());
+        
+        // Verify all rows have the same width
+        let expected_width = rows[0].len();
+        for (i, row) in rows.iter().enumerate() {
+            assert_eq!(row.len(), expected_width, 
+                       "Row {} has width {} but expected {}", i, row.len(), expected_width);
+        }
+
+        let trace_table = TraceTable::init(transpose(rows));
+        println!("DEBUG: Final trace table - length: {}, width: {}", 
+                 trace_table.length(), trace_table.width());
+        
+        trace_table
     }
 }
 
@@ -186,15 +233,19 @@ impl Prover for TrainingUpdateProver {
         DefaultConstraintCommitment<E, Self::HashFn, Self::VC>;
 
     fn get_pub_inputs(&self, trace: &Self::Trace) -> TrainingUpdateInputs {
+        println!("DEBUG: get_pub_inputs() called");
+        
         let rows = trace.length();
         let cols = trace.width();
         let half = cols / 2;
+
+        println!("  - trace rows: {}, cols: {}, half: {}", rows, cols, half);
 
         // extract masked initial (row 0) and masked final (row N)
         let initial_masked: Vec<Felt> = (0..half).map(|c| trace.get(c, 0)).collect();
         let final_masked:   Vec<Felt> = (0..half).map(|c| trace.get(c, rows - 1)).collect();
 
-        TrainingUpdateInputs {
+        let inputs = TrainingUpdateInputs {
             initial_masked,
             final_masked,
             steps:         self.trace_length - 1,
@@ -203,7 +254,16 @@ impl Prover for TrainingUpdateProver {
             learning_rate: self.learning_rate,
             precision:     self.precision,
             batch_size:    self.batch_size,
-        }
+        };
+        
+        // DEBUG: Verify public inputs
+        println!("DEBUG: Public inputs created:");
+        println!("  - steps: {}", inputs.steps);
+        println!("  - batch_size: {}", inputs.batch_size);
+        println!("  - x_batch.len(): {}", inputs.x_batch.len());
+        println!("  - y_batch.len(): {}", inputs.y_batch.len());
+        
+        inputs
     }
 
     fn options(&self) -> &ProofOptions {

@@ -88,6 +88,10 @@ fn main() -> Result<(), Box<dyn Error>> {
         return Err(format!("ZK circuit batch size ({}) cannot exceed sample size ({})", args.bs, SAMPLE_SIZE).into());
     }
 
+    // DEBUG: Add explicit logging for batch size
+    println!("DEBUG: Starting with batch size = {}", args.bs);
+    println!("DEBUG: Step = {:?}", args.step);
+
     //------------------------------------------------------------
     // 1) Common STARK proof options
     //------------------------------------------------------------
@@ -151,6 +155,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                 println!("--- Client Training Updates ---");
             }
             let mut client_reps = Vec::new();
+            let mut total_training_proof_size = 0;
             
             for (i, dev) in devices.iter().enumerate() {
                 // Sample SAMPLE_SIZE rows per device (mirrors Python's next_batch)
@@ -164,6 +169,10 @@ fn main() -> Result<(), Box<dyn Error>> {
                     }
                     continue;
                 }
+                
+                // DEBUG: Verify we're using the correct batch size
+                println!("DEBUG: Device {}, using batch size {} from {} available samples", 
+                         i + 1, args.bs, host_feats.len());
                 
                 // Take the first `bs` samples for the ZK circuit
                 let zk_feats: Vec<Vec<Felt>> = host_feats[..args.bs]
@@ -193,6 +202,13 @@ fn main() -> Result<(), Box<dyn Error>> {
 
                 // Build & prove (ZK circuit processes all `bs` samples internally)
                 let t0 = Instant::now();
+                
+                // DEBUG: Log what we're passing to the prover
+                println!("DEBUG: Creating TrainingUpdateProver with:");
+                println!("  - batch_size: {}", args.bs);
+                println!("  - x_batch.len(): {}", zk_feats.len());
+                println!("  - y_batch.len(): {}", zk_labs.len());
+                
                 let tp = TrainingUpdateProver::new(
                     proof_options.clone(),
                     init_w.clone(), init_b.clone(),
@@ -201,8 +217,17 @@ fn main() -> Result<(), Box<dyn Error>> {
                     lr, pr,
                     args.bs, // This is the ZK circuit's batch size
                 );
+                
+                // DEBUG: Build trace and inspect it
+                let build_start = Instant::now();
                 let trace = tp.build_trace();
+                println!("DEBUG: Trace built in {}ms", build_start.elapsed().as_millis());
+                println!("DEBUG: Trace dimensions - length: {}, width: {}", 
+                         trace.length(), trace.width());
+                
                 let proof = tp.prove(trace.clone())?;
+                let proof_size = proof.to_bytes().len();
+                total_training_proof_size += proof_size;
                 
                 if args.verbose {
                     println!(
@@ -210,9 +235,17 @@ fn main() -> Result<(), Box<dyn Error>> {
                         i + 1,
                         args.bs,
                         t0.elapsed().as_millis(),
-                        proof.to_bytes().len()
+                        proof_size
                     );
+                    // Add this line specifically for Python script parsing:
+                    println!("Training proof size: {} bytes", proof_size);
                 }
+
+                // DEBUG: Verify public inputs
+                let pub_inputs = tp.get_pub_inputs(&trace);
+                println!("DEBUG: Public inputs batch_size: {}", pub_inputs.batch_size);
+                println!("DEBUG: Public inputs x_batch.len(): {}", pub_inputs.x_batch.len());
+                println!("DEBUG: Public inputs y_batch.len(): {}", pub_inputs.y_batch.len());
 
                 // Verify
                 verify::<
@@ -220,7 +253,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                     Blake3_256<Felt>,
                     DefaultRandomCoin<Blake3_256<Felt>>,
                     MerkleTree<Blake3_256<Felt>>,
-                >(proof, tp.get_pub_inputs(&trace), &AcceptableOptions::OptionSet(vec![proof_options.clone()]))
+                >(proof, pub_inputs, &AcceptableOptions::OptionSet(vec![proof_options.clone()]))
                 .expect("training proof failed!");
 
                 // Extract the result (simplified - you might want to extract final weights)
@@ -255,12 +288,12 @@ fn main() -> Result<(), Box<dyn Error>> {
             if args.verbose {
                 println!("Aggregator ready in {}ms\n", agg0.elapsed().as_millis());
                 println!("STEP=setup: Generated {} ZK proofs (bs={})", client_reps.len(), args.bs);
+                // Output total proof size for Python parsing
+                println!("Total training proof size: {} bytes", total_training_proof_size);
             }
         }
         Step::Witness => {
-            // For witness step, we need to generate the aggregator and build trace
-            
-            // Similar setup to the Setup step, but focused on witness generation
+            // Similar debugging for witness step
             let mut client_reps = Vec::new();
             
             for (i, dev) in devices.iter().enumerate() {
@@ -269,6 +302,8 @@ fn main() -> Result<(), Box<dyn Error>> {
                 if host_feats.len() < args.bs {
                     continue;
                 }
+                
+                println!("DEBUG: Witness step - Device {}, batch size {}", i + 1, args.bs);
                 
                 let zk_feats: Vec<Vec<Felt>> = host_feats[..args.bs]
                     .iter()
@@ -301,7 +336,10 @@ fn main() -> Result<(), Box<dyn Error>> {
                     lr, pr,
                     args.bs,
                 );
+                
                 let trace = tp.build_trace();
+                println!("DEBUG: Witness trace - length: {}, width: {}", 
+                         trace.length(), trace.width());
                 
                 // For witness step, we just need the trace, not the proof
                 client_reps.push(trace.get(0, trace.length() - 1));
@@ -334,9 +372,9 @@ fn main() -> Result<(), Box<dyn Error>> {
             }
         }
         Step::Proof => {
-            // Similar to witness step, but also generates the proof
-            
+            // Similar debugging for proof step
             let mut client_reps = Vec::new();
+            let mut total_training_proof_size = 0;
             
             for (i, dev) in devices.iter().enumerate() {
                 let (host_feats, host_labs) = dev.next_batch(SAMPLE_SIZE);
@@ -344,6 +382,8 @@ fn main() -> Result<(), Box<dyn Error>> {
                 if host_feats.len() < args.bs {
                     continue;
                 }
+                
+                println!("DEBUG: Proof step - Device {}, batch size {}", i + 1, args.bs);
                 
                 let zk_feats: Vec<Vec<Felt>> = host_feats[..args.bs]
                     .iter()
@@ -376,16 +416,23 @@ fn main() -> Result<(), Box<dyn Error>> {
                     lr, pr,
                     args.bs,
                 );
+                
                 let trace = tp.build_trace();
+                println!("DEBUG: Proof trace - length: {}, width: {}", 
+                         trace.length(), trace.width());
+                         
                 let proof = tp.prove(trace.clone())?;
+                let proof_size = proof.to_bytes().len();
+                total_training_proof_size += proof_size;
                 
                 // Verify the training proof
+                let pub_inputs = tp.get_pub_inputs(&trace);
                 verify::<
                     TrainingUpdateAir,
                     Blake3_256<Felt>,
                     DefaultRandomCoin<Blake3_256<Felt>>,
                     MerkleTree<Blake3_256<Felt>>,
-                >(proof, tp.get_pub_inputs(&trace), &AcceptableOptions::OptionSet(vec![proof_options.clone()]))
+                >(proof, pub_inputs, &AcceptableOptions::OptionSet(vec![proof_options.clone()]))
                 .expect("training proof failed!");
                 
                 client_reps.push(trace.get(0, trace.length() - 1));
@@ -419,8 +466,12 @@ fn main() -> Result<(), Box<dyn Error>> {
             
             let t2 = Instant::now();
             let pf = agg.prove(tr.clone())?;
+            let aggregation_proof_size = pf.to_bytes().len();
+            
             if args.verbose {
-                println!("proof: {}ms, {} bytes", t2.elapsed().as_millis(), pf.to_bytes().len());
+                println!("proof: {}ms, {} bytes", t2.elapsed().as_millis(), aggregation_proof_size);
+                // Add this line specifically for Python script parsing:
+                println!("Proof size: {} bytes", aggregation_proof_size);
                 print!("verifying… ");
             }
             
@@ -434,6 +485,10 @@ fn main() -> Result<(), Box<dyn Error>> {
             
             if args.verbose {
                 println!("OK");
+                // Output summary for Python parsing
+                println!("Total training proof size: {} bytes", total_training_proof_size);
+                println!("Aggregation proof size: {} bytes", aggregation_proof_size);
+                println!("Total proof size: {} bytes", total_training_proof_size + aggregation_proof_size);
             }
         }
     }
